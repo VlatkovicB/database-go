@@ -19,6 +19,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/query", api.QueryHandler(db))
 	mux.HandleFunc("/tables", api.TablesHandler(db))
+	mux.HandleFunc("/seed", api.SeedHandler(db))
 
 	// Serve frontend from embedded web/ directory.
 	webFS, err := fs.Sub(webFiles, "web")

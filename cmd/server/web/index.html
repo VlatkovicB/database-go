@@ -11,6 +11,13 @@
   header { padding: 14px 24px; background: #161b22; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 16px; }
   header h1 { color: #58a6ff; font-size: 18px; letter-spacing: 1px; }
   header .tag { color: #484f58; font-size: 12px; }
+  button.seed-btn {
+    background: transparent; color: #484f58; border: 1px solid #21262d;
+    padding: 6px 14px; cursor: pointer; font-family: 'Courier New', monospace;
+    font-size: 12px; border-radius: 6px; transition: all 0.15s; margin-left: auto;
+  }
+  button.seed-btn:hover { color: #ffa657; border-color: #ffa657; }
+  button.seed-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .layout { display: flex; flex: 1; overflow: hidden; }
 
@@ -105,6 +112,28 @@
   .pipeline-toggle:hover { color: #c9d1d9; }
 
   .pipeline-stages { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+  /* SQL execution order panel */
+  .stage-exec-order { grid-column: 1 / -1; }
+  .exec-order-flow { display: flex; flex-wrap: wrap; gap: 0; align-items: center; padding: 4px 0; }
+  .exec-order-item {
+    display: flex; align-items: center; gap: 0;
+    opacity: 0; animation: fadeUp 0.25s ease forwards;
+  }
+  .exec-order-badge {
+    display: flex; flex-direction: column; align-items: center;
+    padding: 6px 12px; border-radius: 5px; font-size: 11px; font-weight: bold;
+    border: 1px solid #21262d; letter-spacing: 0.5px; min-width: 60px; text-align: center;
+    transition: all 0.2s;
+  }
+  .exec-order-badge.active {
+    background: #0d2d1a; border-color: #238636; color: #3fb950;
+  }
+  .exec-order-badge.inactive {
+    background: #0d1117; border-color: #1a1a1a; color: #30363d;
+  }
+  .exec-order-badge .eo-num { font-size: 9px; opacity: 0.55; margin-bottom: 2px; font-weight: normal; }
+  .exec-order-arrow { color: #21262d; font-size: 14px; padding: 0 4px; flex-shrink: 0; }
 
   .stage {
     background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
@@ -215,6 +244,7 @@
 <header>
   <h1>MiniDB</h1>
   <span class="tag">in-memory · PostgreSQL subset · Go</span>
+  <button class="seed-btn" id="seedBtn" onclick="seedDB()">⚡ Seed Game DB</button>
 </header>
 <div class="layout">
   <aside class="sidebar">
@@ -268,6 +298,16 @@
               <div class="stage-desc" id="executor-desc"></div>
             </div>
             <div class="stage-body" id="executor-body"></div>
+          </div>
+          <div class="stage stage-exec-order" id="stage-exec-order" style="display:none">
+            <div class="stage-head">
+              <div class="stage-num">★</div>
+              <div class="stage-name">SQL EXECUTION ORDER</div>
+              <div class="stage-desc" id="exec-order-desc">logical clause evaluation sequence</div>
+            </div>
+            <div class="stage-body" id="exec-order-body">
+              <div class="exec-order-flow" id="exec-order-flow"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -355,6 +395,7 @@ async function runQuery() {
       await animateLexer(data.tokens || []);
       await animateParser(data.ast, data.error);
       await animateExecutor(data.execTrace || [], data.error);
+      await animateExecOrder(data.ast);
       renderResult(data);
     }
 
@@ -378,6 +419,8 @@ function resetPipeline() {
   document.getElementById('lexer-desc').textContent = '';
   document.getElementById('parser-desc').textContent = '';
   document.getElementById('executor-desc').textContent = '';
+  document.getElementById('stage-exec-order').style.display = 'none';
+  document.getElementById('exec-order-flow').innerHTML = '';
 }
 
 function delay(ms) {
@@ -471,6 +514,71 @@ async function animateExecutor(steps, error) {
   await delay(steps.length * speed.execStep + speed.execSettle);
   stage.classList.remove('running');
   stage.classList.add('done');
+}
+
+const SQL_EXEC_STEPS = [
+  { num: '1',    clause: 'FROM',     key: 'from'     },
+  { num: '2',    clause: 'JOIN',     key: 'join'     },
+  { num: '3',    clause: 'WHERE',    key: 'where'    },
+  { num: '4',    clause: 'GROUP BY', key: 'groupby'  },
+  { num: '5',    clause: 'HAVING',   key: 'having'   },
+  { num: '6',    clause: 'SELECT',   key: 'select'   },
+  { num: '7',    clause: 'DISTINCT', key: 'distinct' },
+  { num: '8',    clause: 'ORDER BY', key: 'orderby'  },
+  { num: '9',    clause: 'LIMIT',    key: 'limit'    },
+  { num: '10',   clause: 'OFFSET',   key: 'offset'   },
+];
+
+function detectActiveSteps(ast) {
+  if (!ast || ast.type !== 'SelectStatement') return null;
+  return {
+    from:     !!ast.table,
+    join:     Array.isArray(ast.joins) && ast.joins.length > 0,
+    where:    !!ast.where,
+    groupby:  !!ast.groupBy,
+    having:   !!ast.having,
+    select:   true,
+    distinct: !!ast.distinct,
+    orderby:  !!ast.orderBy,
+    limit:    ast.limit != null,
+    offset:   ast.offset != null,
+  };
+}
+
+async function animateExecOrder(ast) {
+  const active = detectActiveSteps(ast);
+  if (!active) return;
+
+  const panel = document.getElementById('stage-exec-order');
+  const flow = document.getElementById('exec-order-flow');
+  panel.style.display = '';
+  panel.classList.add('active', 'running');
+
+  SQL_EXEC_STEPS.forEach((step, i) => {
+    const isActive = !!active[step.key];
+
+    const item = document.createElement('div');
+    item.className = 'exec-order-item';
+    item.style.animationDelay = `${i * speed.tokenStep}ms`;
+
+    const badge = document.createElement('div');
+    badge.className = `exec-order-badge ${isActive ? 'active' : 'inactive'}`;
+    badge.innerHTML = `<span class="eo-num">${esc(step.num)}</span>${esc(step.clause)}`;
+    item.appendChild(badge);
+
+    if (i < SQL_EXEC_STEPS.length - 1) {
+      const arrow = document.createElement('span');
+      arrow.className = 'exec-order-arrow';
+      arrow.textContent = '→';
+      item.appendChild(arrow);
+    }
+
+    flow.appendChild(item);
+  });
+
+  await delay(SQL_EXEC_STEPS.length * speed.tokenStep + speed.tokenSettle);
+  panel.classList.remove('running');
+  panel.classList.add('done');
 }
 
 function renderResult(data) {
@@ -667,6 +775,23 @@ function quickSelect(tableName) {
 
 // Fetch tables on initial load.
 fetchTables();
+
+async function seedDB() {
+  const btn = document.getElementById('seedBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Seeding…';
+  try {
+    const res = await fetch('/seed', { method: 'POST' });
+    const data = await res.json();
+    const errs = data.errors && data.errors.length ? ` (${data.errors.length} skipped)` : '';
+    btn.textContent = `✓ Seeded ${data.ok} rows${errs}`;
+    fetchTables();
+    setTimeout(() => { btn.textContent = '⚡ Seed Game DB'; btn.disabled = false; }, 3000);
+  } catch (e) {
+    btn.textContent = '✗ Failed';
+    setTimeout(() => { btn.textContent = '⚡ Seed Game DB'; btn.disabled = false; }, 2000);
+  }
+}
 
 function esc(str) {
   return String(str)

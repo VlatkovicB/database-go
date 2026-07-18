@@ -78,6 +78,12 @@
     font-size: 13px; border-radius: 6px; transition: all 0.15s;
   }
   button.clear-btn:hover { color: #c9d1d9; border-color: #484f58; }
+  button.fmt-btn {
+    background: transparent; color: #484f58; border: 1px solid #21262d;
+    padding: 8px 14px; cursor: pointer; font-family: 'Courier New', monospace;
+    font-size: 13px; border-radius: 6px; transition: all 0.15s;
+  }
+  button.fmt-btn:hover { color: #d2a8ff; border-color: #6e40c9; }
   .shortcut { color: #484f58; font-size: 12px; }
 
   .speed-group { display: flex; align-items: center; gap: 10px; margin-left: auto; }
@@ -259,6 +265,7 @@
     <div class="controls">
       <button class="run" id="runBtn" onclick="runQuery()">▶ Run</button>
       <button class="clear-btn" onclick="clearQuery()">Clear</button>
+      <button class="fmt-btn" onclick="formatQuery()">⌥ Format</button>
       <span class="shortcut">Ctrl+Enter to run</span>
       <div class="speed-group">
         <span class="speed-label">Speed</span>
@@ -775,6 +782,102 @@ function quickSelect(tableName) {
 
 // Fetch tables on initial load.
 fetchTables();
+
+function formatQuery() {
+  const ta = document.getElementById('query');
+  const formatted = formatSQL(ta.value);
+  if (formatted) ta.value = formatted;
+  ta.focus();
+}
+
+function formatSQL(raw) {
+  let sql = raw.trim();
+  if (!sql) return sql;
+
+  // Strip trailing semicolon — we'll add it back
+  const hasSemi = sql.endsWith(';');
+  if (hasSemi) sql = sql.slice(0, -1).trimEnd();
+
+  // Normalize whitespace
+  sql = sql.replace(/\s+/g, ' ');
+
+  // Uppercase keywords
+  const KW = [
+    'SELECT','DISTINCT','FROM','WHERE','AND','OR','NOT',
+    'INNER','LEFT','OUTER','JOIN','ON','AS',
+    'INSERT','INTO','VALUES','UPDATE','SET',
+    'DELETE','CREATE','DROP','TABLE',
+    'PRIMARY','KEY','GROUP','BY','HAVING','ORDER','LIMIT','OFFSET',
+    'INT','TEXT','BOOLEAN','FLOAT','NULL','TRUE','FALSE',
+  ];
+  const kwRe = new RegExp('\\b(' + KW.join('|') + ')\\b', 'gi');
+  sql = sql.replace(kwRe, m => m.toUpperCase());
+
+  // Collapse multi-word tokens so later regexes are simpler
+  sql = sql
+    .replace(/\bINNER\s+JOIN\b/g, 'INNER JOIN')
+    .replace(/\bLEFT\s+OUTER\s+JOIN\b/g, 'LEFT OUTER JOIN')
+    .replace(/\bLEFT\s+JOIN\b/g, 'LEFT JOIN')
+    .replace(/\bPRIMARY\s+KEY\b/g, 'PRIMARY KEY')
+    .replace(/\bGROUP\s+BY\b/g, 'GROUP BY')
+    .replace(/\bORDER\s+BY\b/g, 'ORDER BY');
+
+  // Major clause breaks (order matters — longer phrases first)
+  sql = sql
+    .replace(/\b(LEFT OUTER JOIN|LEFT JOIN|INNER JOIN|JOIN)\b/g, '\n$1')
+    .replace(/\bFROM\b/g, '\nFROM')
+    .replace(/\bWHERE\b/g, '\nWHERE')
+    .replace(/\bGROUP BY\b/g, '\nGROUP BY')
+    .replace(/\bHAVING\b/g, '\nHAVING')
+    .replace(/\bORDER BY\b/g, '\nORDER BY')
+    .replace(/\bLIMIT\b/g, '\nLIMIT')
+    .replace(/\bOFFSET\b/g, '\nOFFSET')
+    .replace(/\bSET\b/g, '\nSET')
+    .replace(/\bVALUES\b/g, '\nVALUES');
+
+  // AND / OR — indent under WHERE / HAVING
+  sql = sql
+    .replace(/\n(WHERE|HAVING)(.*)/g, (_, kw, rest) => {
+      const indented = rest.replace(/\b(AND|OR)\b/g, '\n  $1');
+      return '\n' + kw + indented;
+    });
+
+  // SELECT column list — split by comma and indent each column
+  sql = sql.replace(/^(SELECT)(.*?)(\nFROM)/s, (_, sel, cols, from) => {
+    const parts = splitTopLevel(cols.trim(), ',');
+    if (parts.length <= 1) return sel + ' ' + cols.trim() + from;
+    return sel + '\n  ' + parts.map(p => p.trim()).join(',\n  ') + from;
+  });
+
+  // INSERT column list and VALUES list — add spaces after commas
+  sql = sql.replace(/\(([^)]+)\)/g, (_, inner) => {
+    const parts = splitTopLevel(inner, ',').map(p => p.trim());
+    return '(' + parts.join(', ') + ')';
+  });
+
+  // Clean up any double blank lines
+  sql = sql.replace(/\n{3,}/g, '\n\n').trim();
+
+  return sql + (hasSemi ? ';' : '');
+}
+
+// Split by delimiter at the top paren level (don't split inside parens).
+function splitTopLevel(str, delim) {
+  const parts = [];
+  let depth = 0, current = '';
+  for (const ch of str) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === delim && depth === 0) {
+      parts.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
 
 async function seedDB() {
   const btn = document.getElementById('seedBtn');

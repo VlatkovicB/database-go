@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -110,6 +111,29 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 		}
 	}
 	return count, nil
+}
+
+type TableInfo struct {
+	Name    string
+	Columns []Column
+	RowCount int
+}
+
+func (db *Database) ListTables() []TableInfo {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var tables []TableInfo
+	for _, t := range db.Tables {
+		tables = append(tables, TableInfo{
+			Name:     t.Name,
+			Columns:  t.Columns,
+			RowCount: len(t.Rows),
+		})
+	}
+	sort.Slice(tables, func(i, j int) bool {
+		return tables[i].Name < tables[j].Name
+	})
+	return tables
 }
 
 // DeleteRows removes every row where predicate returns true.

@@ -56,6 +56,9 @@ func (l *Lexer) Tokenize() []Token {
 		case ch == '>':
 			tokens = append(tokens, Token{GT, ">"})
 			l.pos++
+		case ch == '.':
+			tokens = append(tokens, Token{DOT, "."})
+			l.pos++
 		case ch == '\'':
 			tokens = append(tokens, l.readString())
 		case unicode.IsDigit(rune(ch)):

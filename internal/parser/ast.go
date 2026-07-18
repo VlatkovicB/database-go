@@ -5,9 +5,25 @@ type Statement interface {
 	statementNode()
 }
 
+type JoinType string
+
+const (
+	InnerJoin JoinType = "INNER"
+	LeftJoin  JoinType = "LEFT"
+)
+
+type JoinClause struct {
+	Type      JoinType
+	Table     string
+	Alias     string
+	Condition Expression
+}
+
 type SelectStatement struct {
-	Columns []string // nil = SELECT *
+	Columns []string // nil = SELECT *, otherwise bare "col", "alias.col", or "alias.*"
 	Table   string
+	Alias   string // table alias; defaults to table name
+	Joins   []JoinClause
 	Where   Expression
 }
 
@@ -62,9 +78,10 @@ type BinaryExpr struct {
 	Right Expression
 }
 
-// IdentExpr is a column reference like `age` or `name`.
+// IdentExpr is a column reference like `age`, `name`, or qualified `alias.col`.
 type IdentExpr struct {
-	Name string
+	Table string // optional alias qualifier
+	Name  string
 }
 
 // LiteralExpr holds a concrete value: int64, float64, string, bool, or nil.

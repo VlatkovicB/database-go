@@ -57,21 +57,22 @@ func (p *Parser) expect(tt lexer.TokenType) (lexer.Token, error) {
 	return t, nil
 }
 
-// parseSelect handles: SELECT col1, col2 FROM table [WHERE expr]
+// parseSelect handles: SELECT cols FROM table [alias] [JOIN ...] [WHERE expr]
 func (p *Parser) parseSelect() (*SelectStatement, error) {
 	p.advance() // consume SELECT
 	stmt := &SelectStatement{}
 
+	// Column list: *, alias.*, alias.col, col
 	if p.current().Type == lexer.ASTERISK {
-		stmt.Columns = nil // nil means all columns
+		stmt.Columns = nil
 		p.advance()
 	} else {
 		for {
-			t, err := p.expect(lexer.IDENT)
+			col, err := p.parseSelectColumn()
 			if err != nil {
-				return nil, fmt.Errorf("SELECT: expected column name, got %q", p.current().Literal)
+				return nil, err
 			}
-			stmt.Columns = append(stmt.Columns, t.Literal)
+			stmt.Columns = append(stmt.Columns, col)
 			if p.current().Type != lexer.COMMA {
 				break
 			}
@@ -87,6 +88,30 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 		return nil, fmt.Errorf("SELECT: expected table name")
 	}
 	stmt.Table = t.Literal
+	stmt.Alias = t.Literal // default alias = table name
+
+	// Optional alias: FROM table [AS] alias
+	if p.current().Type == lexer.AS {
+		p.advance()
+		a, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return nil, fmt.Errorf("SELECT FROM: expected alias after AS")
+		}
+		stmt.Alias = a.Literal
+	} else if p.current().Type == lexer.IDENT {
+		stmt.Alias = p.advance().Literal
+	}
+
+	// JOIN clauses
+	for p.current().Type == lexer.JOIN ||
+		p.current().Type == lexer.INNER ||
+		p.current().Type == lexer.LEFT {
+		join, err := p.parseJoin()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Joins = append(stmt.Joins, join)
+	}
 
 	if p.current().Type == lexer.WHERE {
 		p.advance()
@@ -98,6 +123,68 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 	}
 
 	return stmt, nil
+}
+
+// parseSelectColumn parses a single item in the SELECT list.
+// Supports: col, alias.col, alias.*
+func (p *Parser) parseSelectColumn() (string, error) {
+	t, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return "", fmt.Errorf("SELECT: expected column name or alias, got %q", p.current().Literal)
+	}
+	if p.current().Type == lexer.DOT {
+		p.advance() // consume dot
+		if p.current().Type == lexer.ASTERISK {
+			p.advance()
+			return t.Literal + ".*", nil
+		}
+		col, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return "", fmt.Errorf("SELECT: expected column name after %q.", t.Literal)
+		}
+		return t.Literal + "." + col.Literal, nil
+	}
+	return t.Literal, nil
+}
+
+// parseJoin handles: [INNER | LEFT [OUTER]] JOIN table [alias] ON expr
+func (p *Parser) parseJoin() (JoinClause, error) {
+	jt := InnerJoin
+	if p.current().Type == lexer.LEFT {
+		jt = LeftJoin
+		p.advance()
+		if p.current().Type == lexer.OUTER {
+			p.advance() // optional OUTER
+		}
+	} else if p.current().Type == lexer.INNER {
+		p.advance()
+	}
+	if _, err := p.expect(lexer.JOIN); err != nil {
+		return JoinClause{}, fmt.Errorf("JOIN: expected JOIN keyword")
+	}
+	tbl, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return JoinClause{}, fmt.Errorf("JOIN: expected table name")
+	}
+	alias := tbl.Literal
+	if p.current().Type == lexer.AS {
+		p.advance()
+		a, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return JoinClause{}, fmt.Errorf("JOIN: expected alias after AS")
+		}
+		alias = a.Literal
+	} else if p.current().Type == lexer.IDENT {
+		alias = p.advance().Literal
+	}
+	if _, err := p.expect(lexer.ON); err != nil {
+		return JoinClause{}, fmt.Errorf("JOIN: expected ON")
+	}
+	cond, err := p.parseExpression()
+	if err != nil {
+		return JoinClause{}, err
+	}
+	return JoinClause{Type: jt, Table: tbl.Literal, Alias: alias, Condition: cond}, nil
 }
 
 // parseInsert handles: INSERT INTO table [(cols)] VALUES (vals)
@@ -348,6 +435,15 @@ func (p *Parser) parsePrimary() (Expression, error) {
 	t := p.current()
 	if t.Type == lexer.IDENT {
 		p.advance()
+		// Check for qualified ref: alias.col
+		if p.current().Type == lexer.DOT {
+			p.advance() // consume dot
+			col, err := p.expect(lexer.IDENT)
+			if err != nil {
+				return nil, fmt.Errorf("expected column name after %q.", t.Literal)
+			}
+			return &IdentExpr{Table: t.Literal, Name: col.Literal}, nil
+		}
 		return &IdentExpr{Name: t.Literal}, nil
 	}
 	val, err := p.parseLiteral()

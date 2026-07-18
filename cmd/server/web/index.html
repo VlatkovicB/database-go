@@ -14,19 +14,41 @@
 
   .layout { display: flex; flex: 1; overflow: hidden; }
 
-  .sidebar { width: 220px; background: #0d1117; border-right: 1px solid #21262d; padding: 16px; overflow-y: auto; flex-shrink: 0; }
-  .sidebar h3 { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
-  .table-item { padding: 6px 10px; border-radius: 4px; font-size: 13px; color: #8b949e; cursor: pointer; display: flex; align-items: center; gap: 6px; }
-  .table-item:hover { background: #21262d; color: #c9d1d9; }
-  .table-item .icon { color: #388bfd; }
-  .no-tables { color: #484f58; font-size: 12px; font-style: italic; }
+  /* Sidebar */
+  .sidebar { width: 220px; background: #0d1117; border-right: 1px solid #21262d; padding: 12px 0; overflow-y: auto; flex-shrink: 0; }
+  .sidebar-head { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 0 14px 10px; }
+  .no-tables { color: #484f58; font-size: 12px; font-style: italic; padding: 0 14px; }
 
+  .tbl-group { margin-bottom: 2px; }
+  .tbl-row {
+    display: flex; align-items: center; gap: 6px; padding: 6px 14px;
+    cursor: pointer; color: #8b949e; font-size: 13px; user-select: none;
+    transition: background 0.1s, color 0.1s;
+  }
+  .tbl-row:hover { background: #161b22; color: #c9d1d9; }
+  .tbl-arrow { color: #484f58; font-size: 10px; width: 10px; flex-shrink: 0; transition: transform 0.15s; }
+  .tbl-arrow.open { transform: rotate(90deg); }
+  .tbl-icon { color: #388bfd; font-size: 12px; }
+  .tbl-name-text { flex: 1; }
+  .tbl-count { color: #484f58; font-size: 11px; }
+
+  .tbl-cols { display: none; }
+  .tbl-cols.open { display: block; }
+  .col-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 14px 4px 36px; font-size: 12px; color: #484f58;
+  }
+  .col-pk { color: #ffa657; font-size: 10px; }
+  .col-name { color: #8b949e; flex: 1; }
+  .col-type { color: #388bfd; font-size: 11px; }
+
+  /* Main */
   .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 
   .editor-wrap { padding: 20px 24px 0; }
   .editor-label { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
   textarea {
-    width: 100%; height: 140px; background: #0d1117; color: #79c0ff;
+    width: 100%; height: 120px; background: #0d1117; color: #79c0ff;
     border: 1px solid #21262d; padding: 14px 16px;
     font-family: 'Courier New', monospace; font-size: 14px;
     resize: vertical; outline: none; border-radius: 6px; line-height: 1.65;
@@ -51,10 +73,119 @@
   button.clear-btn:hover { color: #c9d1d9; border-color: #484f58; }
   .shortcut { color: #484f58; font-size: 12px; }
 
-  .result-wrap { flex: 1; overflow-y: auto; padding: 20px 24px; }
+  .speed-group { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+  .speed-label { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; white-space: nowrap; }
+  .speed-val { color: #58a6ff; font-size: 12px; width: 52px; text-align: right; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 120px; height: 4px; background: #21262d; border-radius: 2px; outline: none; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #388bfd; border: 2px solid #0d1117; cursor: pointer; transition: background 0.15s;
+  }
+  input[type=range]::-webkit-slider-thumb:hover { background: #58a6ff; }
+  input[type=range]::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #388bfd; border: 2px solid #0d1117; cursor: pointer;
+  }
 
+  .scroll-area { flex: 1; overflow-y: auto; padding: 20px 24px; }
+
+  /* Pipeline */
+  .pipeline { display: none; margin-bottom: 24px; }
+  .pipeline.visible { display: block; }
+  .pipeline-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .pipeline-title { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  .pipeline-toggle { color: #484f58; font-size: 12px; cursor: pointer; background: none; border: none; font-family: inherit; }
+  .pipeline-toggle:hover { color: #c9d1d9; }
+
+  .pipeline-stages { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+  .stage {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+    overflow: hidden; opacity: 0; transform: translateY(8px);
+    transition: opacity 0.3s ease, transform 0.3s ease, border-color 0.3s ease;
+  }
+  .stage.active { opacity: 1; transform: translateY(0); }
+  .stage.running { border-color: #388bfd; }
+  .stage.done { border-color: #238636; }
+
+  .stage-head {
+    padding: 10px 14px; display: flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid #21262d;
+  }
+  .stage-num {
+    width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 11px; font-weight: bold;
+    background: #21262d; color: #484f58; flex-shrink: 0; transition: all 0.3s;
+  }
+  .stage.running .stage-num { background: #1e3a5f; color: #58a6ff; }
+  .stage.done .stage-num { background: #0d2d1a; color: #3fb950; }
+  .stage-name { font-size: 12px; font-weight: bold; color: #484f58; letter-spacing: 1px; transition: color 0.3s; }
+  .stage.running .stage-name { color: #58a6ff; }
+  .stage.done .stage-name { color: #3fb950; }
+  .stage-desc { font-size: 11px; color: #484f58; margin-left: auto; }
+
+  .stage-body { padding: 12px 14px; min-height: 80px; max-height: 280px; overflow-y: auto; }
+
+  /* Token badges */
+  .tokens-wrap { display: flex; flex-wrap: wrap; gap: 5px; }
+  .token-badge {
+    display: inline-flex; flex-direction: column; align-items: center;
+    padding: 3px 7px; border-radius: 4px; font-size: 11px; line-height: 1.4;
+    opacity: 0; animation: fadeUp 0.2s ease forwards;
+  }
+  .token-badge .tok-lit { font-weight: bold; }
+  .token-badge .tok-type { font-size: 9px; opacity: 0.6; margin-top: 1px; }
+
+  .token-badge.keyword  { background: #1e3a5f; color: #79c0ff; border: 1px solid #1f4b7a; }
+  .token-badge.type     { background: #2d1f5f; color: #d2a8ff; border: 1px solid #3d2a7a; }
+  .token-badge.ident    { background: #1a3a1a; color: #7ee787; border: 1px solid #2a5a2a; }
+  .token-badge.literal  { background: #3a2a0d; color: #ffa657; border: 1px solid #5a3a0d; }
+  .token-badge.operator { background: #3a0d2a; color: #f778ba; border: 1px solid #5a0d3a; }
+  .token-badge.punct    { background: #1a1a2a; color: #8b949e; border: 1px solid #21262d; }
+
+  /* AST tree */
+  .ast-tree { font-size: 12px; line-height: 1.8; }
+  .ast-node { opacity: 0; animation: fadeUp 0.2s ease forwards; }
+  .ast-node-type { color: #d2a8ff; font-weight: bold; }
+  .ast-node-key { color: #8b949e; }
+  .ast-node-val { color: #ffa657; }
+  .ast-node-val.str { color: #a5d6ff; }
+  .ast-node-val.bool { color: #f778ba; }
+  .ast-node-val.null { color: #484f58; font-style: italic; }
+  .ast-indent { margin-left: 16px; border-left: 1px solid #21262d; padding-left: 10px; }
+
+  /* Exec steps */
+  .exec-steps { }
+  .exec-step {
+    display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px;
+    opacity: 0; animation: fadeUp 0.2s ease forwards;
+  }
+  .exec-step-num {
+    width: 20px; height: 20px; border-radius: 50%;
+    background: #0d2d1a; color: #3fb950; border: 1px solid #238636;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: bold; flex-shrink: 0; margin-top: 1px;
+  }
+  .exec-step-text { color: #c9d1d9; font-size: 12px; line-height: 1.6; }
+
+  /* Arrow between stages */
+  .pipeline-stages { position: relative; }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Results */
   .msg { padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
-  .msg.ok { background: #0d2d1a; border: 1px solid #238636; color: #3fb950; }
+  .msg.ok  { background: #0d2d1a; border: 1px solid #238636; color: #3fb950; }
   .msg.err { background: #2d0d0d; border: 1px solid #da3633; color: #f85149; }
 
   .result-meta { color: #484f58; font-size: 12px; margin-bottom: 10px; }
@@ -76,6 +207,8 @@
   }
   .hist-item:hover { border-color: #388bfd; color: #c9d1d9; }
   .hist-item .htime { color: #484f58; font-size: 11px; flex-shrink: 0; margin-left: 12px; }
+
+  .pipeline-collapsed .stage-body { display: none; }
 </style>
 </head>
 <body>
@@ -85,7 +218,7 @@
 </header>
 <div class="layout">
   <aside class="sidebar">
-    <h3>Tables</h3>
+    <div class="sidebar-head">Tables</div>
     <div id="tableList"><span class="no-tables">none yet</span></div>
   </aside>
   <div class="main">
@@ -97,9 +230,52 @@
       <button class="run" id="runBtn" onclick="runQuery()">▶ Run</button>
       <button class="clear-btn" onclick="clearQuery()">Clear</button>
       <span class="shortcut">Ctrl+Enter to run</span>
+      <div class="speed-group">
+        <span class="speed-label">Speed</span>
+        <input type="range" id="speedSlider" min="0" max="100" value="70" oninput="onSpeedChange(this.value)">
+        <span class="speed-val" id="speedVal">normal</span>
+      </div>
     </div>
-    <div class="result-wrap">
+
+    <div class="scroll-area">
+      <!-- Pipeline visualization -->
+      <div class="pipeline" id="pipeline">
+        <div class="pipeline-header">
+          <span class="pipeline-title">Execution Pipeline</span>
+          <button class="pipeline-toggle" onclick="togglePipeline()">collapse ▲</button>
+        </div>
+        <div class="pipeline-stages" id="pipelineStages">
+          <div class="stage" id="stage-lexer">
+            <div class="stage-head">
+              <div class="stage-num">1</div>
+              <div class="stage-name">LEXER</div>
+              <div class="stage-desc" id="lexer-desc"></div>
+            </div>
+            <div class="stage-body" id="lexer-body"></div>
+          </div>
+          <div class="stage" id="stage-parser">
+            <div class="stage-head">
+              <div class="stage-num">2</div>
+              <div class="stage-name">PARSER</div>
+              <div class="stage-desc" id="parser-desc"></div>
+            </div>
+            <div class="stage-body" id="parser-body"></div>
+          </div>
+          <div class="stage" id="stage-executor">
+            <div class="stage-head">
+              <div class="stage-num">3</div>
+              <div class="stage-name">EXECUTOR</div>
+              <div class="stage-desc" id="executor-desc"></div>
+            </div>
+            <div class="stage-body" id="executor-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Query result -->
       <div id="result"></div>
+
+      <!-- History -->
       <div id="historyWrap" class="history-wrap" style="display:none">
         <h3>History</h3>
         <div id="historyList"></div>
@@ -110,7 +286,39 @@
 
 <script>
 const queryHistory = [];
-let knownTables = new Set();
+let pipelineCollapsed = false;
+
+// slider 0 = instant, 100 = slowest
+// exponential curve so mid-range feels "normal"
+let speed = sliderToSpeed(70);
+
+function sliderToSpeed(v) {
+  v = Number(v);
+  if (v === 0) return { tokenStep: 0, tokenSettle: 0, parserSettle: 0, execStep: 0, execSettle: 0 };
+  // map 1-100 exponentially to 1-200ms range
+  const t = Math.round(Math.pow(v / 100, 2.5) * 200);
+  return {
+    tokenStep:    t,
+    tokenSettle:  Math.round(t * 2.5),
+    parserSettle: Math.round(t * 3),
+    execStep:     Math.round(t * 1.5),
+    execSettle:   Math.round(t * 2),
+  };
+}
+
+function sliderLabel(v) {
+  v = Number(v);
+  if (v === 0)   return 'instant';
+  if (v <= 20)   return 'fast';
+  if (v <= 50)   return 'normal';
+  if (v <= 75)   return 'slow';
+  return 'very slow';
+}
+
+function onSpeedChange(v) {
+  speed = sliderToSpeed(v);
+  document.getElementById('speedVal').textContent = sliderLabel(v);
+}
 
 document.getElementById('query').addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runQuery();
@@ -124,8 +332,10 @@ async function runQuery() {
   btn.disabled = true;
   btn.textContent = '⏳ Running';
 
-  const resultEl = document.getElementById('result');
-  resultEl.innerHTML = '';
+  // Reset pipeline
+  resetPipeline();
+  document.getElementById('result').innerHTML = '';
+  document.getElementById('pipeline').classList.add('visible');
 
   try {
     const res = await fetch('/query', {
@@ -137,38 +347,244 @@ async function runQuery() {
 
     pushHistory(sql);
 
-    if (data.error) {
-      resultEl.innerHTML = `<div class="msg err">✗ ${esc(data.error)}</div>`;
-    } else if (data.columns && data.columns.length > 0) {
-      const rows = data.rows || [];
-      let html = `<div class="result-meta">${rows.length} row${rows.length !== 1 ? 's' : ''}</div>`;
-      html += `<div class="table-wrap"><table><thead><tr>`;
-      html += data.columns.map(c => `<th>${esc(c)}</th>`).join('');
-      html += `</tr></thead><tbody>`;
-      for (const row of rows) {
-        html += `<tr>` + row.map(cell =>
-          cell === null
-            ? `<td class="null-val">NULL</td>`
-            : `<td>${esc(String(cell))}</td>`
-        ).join('') + `</tr>`;
-      }
-      html += `</tbody></table></div>`;
-      resultEl.innerHTML = html;
-    } else if (data.message) {
-      resultEl.innerHTML = `<div class="msg ok">✓ ${esc(data.message)}</div>`;
-      refreshTables(sql);
+    if (data.error && !data.tokens) {
+      // Complete failure before lexing
+      document.getElementById('result').innerHTML = `<div class="msg err">✗ ${esc(data.error)}</div>`;
+    } else {
+      // Animate pipeline in sequence
+      await animateLexer(data.tokens || []);
+      await animateParser(data.ast, data.error);
+      await animateExecutor(data.execTrace || [], data.error);
+      renderResult(data);
     }
+
+    refreshTables(data);
   } catch (err) {
-    resultEl.innerHTML = `<div class="msg err">✗ Connection error: ${esc(err.message)}</div>`;
+    document.getElementById('result').innerHTML = `<div class="msg err">✗ Connection error: ${esc(err.message)}</div>`;
   } finally {
     btn.disabled = false;
     btn.textContent = '▶ Run';
   }
 }
 
+function resetPipeline() {
+  ['stage-lexer', 'stage-parser', 'stage-executor'].forEach(id => {
+    const el = document.getElementById(id);
+    el.className = 'stage';
+  });
+  document.getElementById('lexer-body').innerHTML = '';
+  document.getElementById('parser-body').innerHTML = '';
+  document.getElementById('executor-body').innerHTML = '';
+  document.getElementById('lexer-desc').textContent = '';
+  document.getElementById('parser-desc').textContent = '';
+  document.getElementById('executor-desc').textContent = '';
+}
+
+function delay(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function animateLexer(tokens) {
+  const stage = document.getElementById('stage-lexer');
+  const body = document.getElementById('lexer-body');
+  const desc = document.getElementById('lexer-desc');
+
+  stage.classList.add('active', 'running');
+  await delay(80);
+
+  desc.textContent = `${tokens.length} tokens`;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'tokens-wrap';
+  body.appendChild(wrap);
+
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    const badge = document.createElement('div');
+    badge.className = `token-badge ${t.category}`;
+    badge.style.animationDelay = `${i * speed.tokenStep}ms`;
+    badge.innerHTML = `<span class="tok-lit">${esc(t.literal)}</span><span class="tok-type">${esc(t.typeName)}</span>`;
+    wrap.appendChild(badge);
+  }
+
+  await delay(tokens.length * speed.tokenStep + speed.tokenSettle);
+  stage.classList.remove('running');
+  stage.classList.add('done');
+}
+
+async function animateParser(ast, error) {
+  const stage = document.getElementById('stage-parser');
+  const body = document.getElementById('parser-body');
+  const desc = document.getElementById('parser-desc');
+
+  stage.classList.add('active', 'running');
+  await delay(80);
+
+  if (error && !ast) {
+    desc.textContent = 'parse error';
+    body.innerHTML = `<div style="color:#f85149;font-size:12px">${esc(error)}</div>`;
+    stage.classList.remove('running');
+    return;
+  }
+
+  if (ast) {
+    desc.textContent = ast.type || 'AST';
+    const tree = document.createElement('div');
+    tree.className = 'ast-tree';
+    renderASTNode(tree, ast, 0);
+    body.appendChild(tree);
+  }
+
+  await delay(speed.parserSettle);
+  stage.classList.remove('running');
+  stage.classList.add('done');
+}
+
+async function animateExecutor(steps, error) {
+  const stage = document.getElementById('stage-executor');
+  const body = document.getElementById('executor-body');
+  const desc = document.getElementById('executor-desc');
+
+  stage.classList.add('active', 'running');
+  await delay(80);
+
+  if (error && steps.length === 0) {
+    desc.textContent = 'error';
+    body.innerHTML = `<div style="color:#f85149;font-size:12px">${esc(error)}</div>`;
+    stage.classList.remove('running');
+    return;
+  }
+
+  desc.textContent = `${steps.length} step(s)`;
+  const wrap = document.createElement('div');
+  wrap.className = 'exec-steps';
+  body.appendChild(wrap);
+
+  steps.forEach((step, i) => {
+    const el = document.createElement('div');
+    el.className = 'exec-step';
+    el.style.animationDelay = `${i * speed.execStep}ms`;
+    el.innerHTML = `<div class="exec-step-num">${i + 1}</div><div class="exec-step-text">${esc(step)}</div>`;
+    wrap.appendChild(el);
+  });
+
+  await delay(steps.length * speed.execStep + speed.execSettle);
+  stage.classList.remove('running');
+  stage.classList.add('done');
+}
+
+function renderResult(data) {
+  const resultEl = document.getElementById('result');
+  if (data.error) {
+    resultEl.innerHTML = `<div class="msg err">✗ ${esc(data.error)}</div>`;
+  } else if (data.columns && data.columns.length > 0) {
+    const rows = data.rows || [];
+    let html = `<div class="result-meta">${rows.length} row${rows.length !== 1 ? 's' : ''}</div>`;
+    html += `<div class="table-wrap"><table><thead><tr>`;
+    html += data.columns.map(c => `<th>${esc(c)}</th>`).join('');
+    html += `</tr></thead><tbody>`;
+    for (const row of rows) {
+      html += `<tr>` + row.map(cell =>
+        cell === null ? `<td class="null-val">NULL</td>` : `<td>${esc(String(cell))}</td>`
+      ).join('') + `</tr>`;
+    }
+    html += `</tbody></table></div>`;
+    resultEl.innerHTML = html;
+  } else if (data.message) {
+    resultEl.innerHTML = `<div class="msg ok">✓ ${esc(data.message)}</div>`;
+  }
+}
+
+// Recursively render an AST node as an indented tree.
+function renderASTNode(parent, node, depth) {
+  if (node === null || node === undefined) return;
+
+  if (typeof node !== 'object') {
+    // Primitive leaf
+    const el = document.createElement('div');
+    el.className = 'ast-node';
+    el.style.animationDelay = `${depth * 60}ms`;
+    const cls = typeof node === 'string' ? 'str' : (typeof node === 'boolean' ? 'bool' : '');
+    el.innerHTML = `<span class="ast-node-val ${cls}">${esc(String(node))}</span>`;
+    parent.appendChild(el);
+    return;
+  }
+
+  if (Array.isArray(node)) {
+    node.forEach((item, i) => {
+      const el = document.createElement('div');
+      el.className = 'ast-node';
+      el.style.animationDelay = `${(depth + i) * 50}ms`;
+      el.innerHTML = `<span class="ast-node-key">[${i}]</span> `;
+      parent.appendChild(el);
+      if (typeof item === 'object' && item !== null) {
+        const indent = document.createElement('div');
+        indent.className = 'ast-indent';
+        parent.appendChild(indent);
+        renderASTNode(indent, item, depth + 1);
+      } else {
+        el.innerHTML += `<span class="ast-node-val ${typeof item === 'string' ? 'str' : ''}">${esc(String(item))}</span>`;
+      }
+    });
+    return;
+  }
+
+  // Object node
+  const typeVal = node.type;
+  if (typeVal) {
+    const typeEl = document.createElement('div');
+    typeEl.className = 'ast-node';
+    typeEl.style.animationDelay = `${depth * 50}ms`;
+    typeEl.innerHTML = `<span class="ast-node-type">${esc(typeVal)}</span>`;
+    parent.appendChild(typeEl);
+  }
+
+  const indent = document.createElement('div');
+  indent.className = 'ast-indent';
+  parent.appendChild(indent);
+
+  let childDepth = depth + 1;
+  for (const [key, val] of Object.entries(node)) {
+    if (key === 'type') continue;
+    if (val === null || val === undefined) continue;
+
+    const keyEl = document.createElement('div');
+    keyEl.className = 'ast-node';
+    keyEl.style.animationDelay = `${childDepth * 50}ms`;
+
+    if (typeof val === 'object') {
+      keyEl.innerHTML = `<span class="ast-node-key">${esc(key)}:</span>`;
+      indent.appendChild(keyEl);
+      const childIndent = document.createElement('div');
+      childIndent.className = 'ast-indent';
+      indent.appendChild(childIndent);
+      renderASTNode(childIndent, val, childDepth + 1);
+    } else {
+      const valCls = typeof val === 'string' ? 'str' : (typeof val === 'boolean' ? 'bool' : '');
+      keyEl.innerHTML = `<span class="ast-node-key">${esc(key)}:</span> <span class="ast-node-val ${valCls}">${esc(String(val))}</span>`;
+      indent.appendChild(keyEl);
+    }
+    childDepth++;
+  }
+}
+
+function togglePipeline() {
+  const stages = document.getElementById('pipelineStages');
+  const btn = document.querySelector('.pipeline-toggle');
+  pipelineCollapsed = !pipelineCollapsed;
+  if (pipelineCollapsed) {
+    stages.style.display = 'none';
+    btn.textContent = 'expand ▼';
+  } else {
+    stages.style.display = 'grid';
+    btn.textContent = 'collapse ▲';
+  }
+}
+
 function clearQuery() {
   document.getElementById('query').value = '';
   document.getElementById('result').innerHTML = '';
+  document.getElementById('pipeline').classList.remove('visible');
   document.getElementById('query').focus();
 }
 
@@ -195,29 +611,53 @@ function loadHistory(i) {
   document.getElementById('query').focus();
 }
 
-// Detect CREATE TABLE / DROP TABLE to update the sidebar.
-function refreshTables(sql) {
-  const up = sql.toUpperCase().trim();
-  const createMatch = up.match(/^CREATE\s+TABLE\s+(\w+)/);
-  const dropMatch = up.match(/^DROP\s+TABLE\s+(\w+)/);
-  if (createMatch) {
-    knownTables.add(createMatch[1].toLowerCase());
-    renderTables();
-  } else if (dropMatch) {
-    knownTables.delete(dropMatch[1].toLowerCase());
-    renderTables();
+async function fetchTables() {
+  try {
+    const res = await fetch('/tables');
+    const data = await res.json();
+    renderTables(data.tables || []);
+  } catch (e) {
+    // silently ignore — server may not be ready
   }
 }
 
-function renderTables() {
+function renderTables(tables) {
   const el = document.getElementById('tableList');
-  if (knownTables.size === 0) {
+  if (!tables || tables.length === 0) {
     el.innerHTML = `<span class="no-tables">none yet</span>`;
     return;
   }
-  el.innerHTML = [...knownTables].sort().map(t =>
-    `<div class="table-item" onclick="quickSelect('${t}')"><span class="icon">▤</span>${t}</div>`
-  ).join('');
+  el.innerHTML = tables.map(t => {
+    const safeId = `tbl-${CSS.escape(t.name)}`;
+    const cols = (t.columns || []).map(c => `
+      <div class="col-row">
+        <span class="col-pk">${c.primary ? '🔑' : '·'}</span>
+        <span class="col-name">${esc(c.name)}</span>
+        <span class="col-type">${esc(c.type)}</span>
+      </div>`).join('');
+    return `
+      <div class="tbl-group">
+        <div class="tbl-row" onclick="toggleTable('${esc(t.name)}', '${safeId}')">
+          <span class="tbl-arrow" id="arrow-${safeId}">▶</span>
+          <span class="tbl-icon">▤</span>
+          <span class="tbl-name-text">${esc(t.name)}</span>
+          <span class="tbl-count">${t.rowCount}</span>
+        </div>
+        <div class="tbl-cols" id="cols-${safeId}">${cols}</div>
+      </div>`;
+  }).join('');
+}
+
+function toggleTable(name, safeId) {
+  const cols = document.getElementById(`cols-${safeId}`);
+  const arrow = document.getElementById(`arrow-${safeId}`);
+  if (!cols) return;
+  const open = cols.classList.toggle('open');
+  arrow.classList.toggle('open', open);
+}
+
+function refreshTables(data) {
+  if (!data.error) fetchTables();
 }
 
 function quickSelect(tableName) {
@@ -225,12 +665,12 @@ function quickSelect(tableName) {
   runQuery();
 }
 
+// Fetch tables on initial load.
+fetchTables();
+
 function esc(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+  return String(str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 </script>
 </body>

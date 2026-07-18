@@ -57,22 +57,22 @@ func (p *Parser) expect(tt lexer.TokenType) (lexer.Token, error) {
 	return t, nil
 }
 
-// parseSelect handles: SELECT cols FROM table [alias] [JOIN ...] [WHERE expr]
+// parseSelect handles: SELECT cols FROM table [alias] [JOIN ...] [WHERE expr] [GROUP BY cols] [HAVING expr]
 func (p *Parser) parseSelect() (*SelectStatement, error) {
 	p.advance() // consume SELECT
 	stmt := &SelectStatement{}
 
-	// Column list: *, alias.*, alias.col, col
+	// Column list: *, alias.*, alias.col, col, COUNT(*), SUM(col), ...
 	if p.current().Type == lexer.ASTERISK {
-		stmt.Columns = nil
+		stmt.Exprs = nil // SELECT *
 		p.advance()
 	} else {
 		for {
-			col, err := p.parseSelectColumn()
+			expr, err := p.parseSelectColumn()
 			if err != nil {
 				return nil, err
 			}
-			stmt.Columns = append(stmt.Columns, col)
+			stmt.Exprs = append(stmt.Exprs, expr)
 			if p.current().Type != lexer.COMMA {
 				break
 			}
@@ -122,29 +122,89 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 		stmt.Where = expr
 	}
 
+	if p.current().Type == lexer.GROUP {
+		p.advance() // consume GROUP
+		if _, err := p.expect(lexer.BY); err != nil {
+			return nil, fmt.Errorf("SELECT: expected BY after GROUP")
+		}
+		for {
+			col, err := p.expect(lexer.IDENT)
+			if err != nil {
+				return nil, fmt.Errorf("GROUP BY: expected column name")
+			}
+			stmt.GroupBy = append(stmt.GroupBy, col.Literal)
+			if p.current().Type != lexer.COMMA {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	if p.current().Type == lexer.HAVING {
+		p.advance()
+		expr, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Having = expr
+	}
+
 	return stmt, nil
 }
 
 // parseSelectColumn parses a single item in the SELECT list.
-// Supports: col, alias.col, alias.*
-func (p *Parser) parseSelectColumn() (string, error) {
+// Supports: col, alias.col, alias.*, COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+func (p *Parser) parseSelectColumn() (SelectExpr, error) {
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
-		return "", fmt.Errorf("SELECT: expected column name or alias, got %q", p.current().Literal)
+		return nil, fmt.Errorf("SELECT: expected column name or aggregate, got %q", p.current().Literal)
 	}
+
+	// Aggregate function: IDENT(...)
+	if p.current().Type == lexer.LPAREN {
+		fn := strings.ToUpper(t.Literal)
+		switch fn {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+			p.advance() // consume (
+			arg := "*"
+			if p.current().Type == lexer.ASTERISK {
+				p.advance() // consume *
+			} else {
+				col, err := p.expect(lexer.IDENT)
+				if err != nil {
+					return nil, fmt.Errorf("%s: expected column or *", fn)
+				}
+				arg = col.Literal
+				if p.current().Type == lexer.DOT {
+					p.advance()
+					col2, err := p.expect(lexer.IDENT)
+					if err != nil {
+						return nil, fmt.Errorf("%s: expected column after .", fn)
+					}
+					arg = col.Literal + "." + col2.Literal
+				}
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("%s: expected )", fn)
+			}
+			return &AggSelectExpr{Func: fn, Arg: arg}, nil
+		}
+	}
+
+	// Plain column reference: col, alias.col, alias.*
 	if p.current().Type == lexer.DOT {
 		p.advance() // consume dot
 		if p.current().Type == lexer.ASTERISK {
 			p.advance()
-			return t.Literal + ".*", nil
+			return &ColSelectExpr{Col: t.Literal + ".*"}, nil
 		}
 		col, err := p.expect(lexer.IDENT)
 		if err != nil {
-			return "", fmt.Errorf("SELECT: expected column name after %q.", t.Literal)
+			return nil, fmt.Errorf("SELECT: expected column name after %q.", t.Literal)
 		}
-		return t.Literal + "." + col.Literal, nil
+		return &ColSelectExpr{Col: t.Literal + "." + col.Literal}, nil
 	}
-	return t.Literal, nil
+	return &ColSelectExpr{Col: t.Literal}, nil
 }
 
 // parseJoin handles: [INNER | LEFT [OUTER]] JOIN table [alias] ON expr
@@ -435,6 +495,28 @@ func (p *Parser) parsePrimary() (Expression, error) {
 	t := p.current()
 	if t.Type == lexer.IDENT {
 		p.advance()
+		// Aggregate function in expression context: COUNT(*), AVG(col), etc. (used in HAVING)
+		if p.current().Type == lexer.LPAREN {
+			fn := strings.ToUpper(t.Literal)
+			switch fn {
+			case "COUNT", "SUM", "AVG", "MIN", "MAX":
+				p.advance() // consume (
+				var arg Expression
+				if p.current().Type == lexer.ASTERISK {
+					p.advance() // consume * — arg stays nil (meaning *)
+				} else {
+					var err error
+					arg, err = p.parseExpression()
+					if err != nil {
+						return nil, err
+					}
+				}
+				if _, err := p.expect(lexer.RPAREN); err != nil {
+					return nil, fmt.Errorf("%s(): expected )", fn)
+				}
+				return &AggFuncExpr{Func: fn, Arg: arg}, nil
+			}
+		}
 		// Check for qualified ref: alias.col
 		if p.current().Type == lexer.DOT {
 			p.advance() // consume dot

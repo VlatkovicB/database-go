@@ -46,6 +46,11 @@ const (
 	ON
 	AS
 
+	// Grouping keywords
+	GROUP
+	BY
+	HAVING
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -92,6 +97,9 @@ var keywords = map[string]TokenType{
 	"OUTER":   OUTER,
 	"ON":      ON,
 	"AS":      AS,
+	"GROUP":   GROUP,
+	"BY":      BY,
+	"HAVING":  HAVING,
 }
 
 type Token struct {
@@ -109,6 +117,7 @@ var tokenNames = map[TokenType]string{
 	INT: "INT", TEXT: "TEXT", BOOLEAN: "BOOLEAN", FLOAT: "FLOAT",
 	PRIMARY: "PRIMARY", KEY: "KEY",
 	JOIN: "JOIN", INNER: "INNER", LEFT: "LEFT", OUTER: "OUTER", ON: "ON", AS: "AS",
+	GROUP: "GROUP", BY: "BY", HAVING: "HAVING",
 	ASTERISK: "*", COMMA: ",", SEMICOLON: ";", LPAREN: "(", RPAREN: ")",
 	DOT: ".", EQ: "=", NEQ: "!=", LT: "<", GT: ">", LTE: "<=", GTE: ">=",
 }
@@ -123,7 +132,7 @@ func (t TokenType) Name() string {
 func (t TokenType) Category() string {
 	switch t {
 	case SELECT, FROM, WHERE, INSERT, INTO, VALUES, UPDATE, SET, DELETE, CREATE, TABLE, DROP, AND, OR, NOT, NULL, TRUE, FALSE,
-		JOIN, INNER, LEFT, OUTER, ON, AS:
+		JOIN, INNER, LEFT, OUTER, ON, AS, GROUP, BY, HAVING:
 		return "keyword"
 	case INT, TEXT, BOOLEAN, FLOAT, PRIMARY, KEY:
 		return "type"

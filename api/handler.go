@@ -116,9 +116,18 @@ func serializeTokens(tokens []lexer.Token) []TraceToken {
 func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 	switch s := stmt.(type) {
 	case *parser.SelectStatement:
-		cols := interface{}("*")
-		if s.Columns != nil {
-			cols = s.Columns
+		var exprList interface{} = "*"
+		if s.Exprs != nil {
+			var items []interface{}
+			for _, ex := range s.Exprs {
+				switch e := ex.(type) {
+				case *parser.ColSelectExpr:
+					items = append(items, e.Col)
+				case *parser.AggSelectExpr:
+					items = append(items, e.Func+"("+e.Arg+")")
+				}
+			}
+			exprList = items
 		}
 		var joins []map[string]interface{}
 		for _, j := range s.Joins {
@@ -134,8 +143,10 @@ func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 			"table":   s.Table,
 			"alias":   s.Alias,
 			"joins":   joins,
-			"columns": cols,
+			"columns": exprList,
 			"where":   exprToTrace(s.Where),
+			"groupBy": s.GroupBy,
+			"having":  exprToTrace(s.Having),
 		}
 	case *parser.InsertStatement:
 		cols := interface{}("<positional>")
@@ -206,6 +217,16 @@ func exprToTrace(expr parser.Expression) interface{} {
 		return map[string]interface{}{
 			"type":  "LiteralExpr",
 			"value": e.Value,
+		}
+	case *parser.AggFuncExpr:
+		arg := interface{}("*")
+		if e.Arg != nil {
+			arg = exprToTrace(e.Arg)
+		}
+		return map[string]interface{}{
+			"type": "AggFuncExpr",
+			"func": e.Func,
+			"arg":  arg,
 		}
 	}
 	return nil

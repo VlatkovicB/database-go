@@ -42,10 +42,23 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 }
 
 func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
+	// Route to group-by engine if aggregates or GROUP BY present.
+	if len(s.GroupBy) > 0 || hasAggExprs(s.Exprs) {
+		return e.execSelectGroupBy(s)
+	}
 	if len(s.Joins) > 0 || s.Alias != s.Table {
 		return e.execSelectJoin(s)
 	}
 	return e.execSelectSingle(s)
+}
+
+func hasAggExprs(exprs []parser.SelectExpr) bool {
+	for _, ex := range exprs {
+		if _, ok := ex.(*parser.AggSelectExpr); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // execSelectSingle handles the original single-table path (no joins, no alias).
@@ -71,12 +84,16 @@ func (e *Executor) execSelectSingle(s *parser.SelectStatement) (*Result, error) 
 	}
 
 	var colNames []string
-	if s.Columns == nil {
+	if s.Exprs == nil {
 		for _, c := range cols {
 			colNames = append(colNames, c.Name)
 		}
 	} else {
-		colNames = s.Columns
+		for _, expr := range s.Exprs {
+			if ex, ok := expr.(*parser.ColSelectExpr); ok {
+				colNames = append(colNames, ex.Col)
+			}
+		}
 	}
 
 	whereDesc := "none"
@@ -84,7 +101,7 @@ func (e *Executor) execSelectSingle(s *parser.SelectStatement) (*Result, error) 
 		whereDesc = ExprString(s.Where)
 	}
 	colDesc := "*"
-	if s.Columns != nil {
+	if s.Exprs != nil {
 		colDesc = fmt.Sprintf("[%s]", joinStrings(colNames))
 	}
 
@@ -205,7 +222,7 @@ func (e *Executor) execSelectJoin(s *parser.SelectStatement) (*Result, error) {
 
 	// 4. Resolve projection columns.
 	var proj []projCol
-	if s.Columns == nil {
+	if s.Exprs == nil {
 		// SELECT * — all columns in schema order across all aliases.
 		for _, a := range aliasOrder {
 			for _, c := range aliasSchema[a] {
@@ -213,9 +230,13 @@ func (e *Executor) execSelectJoin(s *parser.SelectStatement) (*Result, error) {
 			}
 		}
 	} else {
-		for _, col := range s.Columns {
+		for _, expr := range s.Exprs {
+			ex, ok := expr.(*parser.ColSelectExpr)
+			if !ok {
+				return nil, fmt.Errorf("aggregate functions in JOINs require GROUP BY (not yet supported)")
+			}
+			col := ex.Col
 			if strings.HasSuffix(col, ".*") {
-				// alias.* — expand to all columns from that alias.
 				a := strings.TrimSuffix(col, ".*")
 				schema, ok := aliasSchema[a]
 				if !ok {
@@ -225,10 +246,8 @@ func (e *Executor) execSelectJoin(s *parser.SelectStatement) (*Result, error) {
 					proj = append(proj, projCol{key: a + "." + c.Name, name: c.Name})
 				}
 			} else if idx := strings.Index(col, "."); idx >= 0 {
-				// alias.col
 				proj = append(proj, projCol{key: col, name: col[idx+1:]})
 			} else {
-				// bare col — find which alias owns it.
 				found := false
 				for _, a := range aliasOrder {
 					for _, c := range aliasSchema[a] {
@@ -443,6 +462,17 @@ func evalExpr(expr parser.Expression, row storage.Row) (interface{}, error) {
 		return e.Value, nil
 	case *parser.BinaryExpr:
 		return evalBinary(e, row)
+	case *parser.AggFuncExpr:
+		// In HAVING context, pre-computed aggregate values live in the synthetic row.
+		arg := "*"
+		if e.Arg != nil {
+			arg = ExprString(e.Arg)
+		}
+		key := e.Func + "(" + arg + ")"
+		if val, ok := row[key]; ok {
+			return val, nil
+		}
+		return nil, fmt.Errorf("aggregate %s not computed (use in HAVING after GROUP BY)", key)
 	}
 	return nil, fmt.Errorf("unknown expression type %T", expr)
 }
@@ -545,6 +575,12 @@ func ExprString(expr parser.Expression) string {
 			return "NULL"
 		}
 		return fmt.Sprintf("%v", e.Value)
+	case *parser.AggFuncExpr:
+		arg := "*"
+		if e.Arg != nil {
+			arg = ExprString(e.Arg)
+		}
+		return e.Func + "(" + arg + ")"
 	}
 	return "?"
 }
@@ -558,6 +594,257 @@ func joinStrings(ss []string) string {
 		result += s
 	}
 	return result
+}
+
+type aggSpec struct{ fn, arg string }
+
+func (e *Executor) execSelectGroupBy(s *parser.SelectStatement) (*Result, error) {
+	if len(s.Joins) > 0 {
+		return nil, fmt.Errorf("GROUP BY with JOINs not yet supported")
+	}
+
+	rows, cols, err := e.db.Scan(s.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply WHERE.
+	var filtered []storage.Row
+	for _, row := range rows {
+		if s.Where == nil {
+			filtered = append(filtered, row)
+			continue
+		}
+		match, err := evalExpr(s.Where, row)
+		if err != nil {
+			return nil, err
+		}
+		if boolVal(match) {
+			filtered = append(filtered, row)
+		}
+	}
+
+	// Group rows.
+	type group struct {
+		keyVals map[string]interface{}
+		rows    []storage.Row
+	}
+	var groups []*group
+	groupIndex := map[string]int{}
+
+	if len(s.GroupBy) == 0 {
+		// No GROUP BY but has aggregates — treat all rows as one group.
+		groups = []*group{{keyVals: map[string]interface{}{}, rows: filtered}}
+	} else {
+		for _, row := range filtered {
+			var keyParts []string
+			for _, col := range s.GroupBy {
+				keyParts = append(keyParts, fmt.Sprintf("%v", row[col]))
+			}
+			key := strings.Join(keyParts, "\x00")
+			if idx, ok := groupIndex[key]; ok {
+				groups[idx].rows = append(groups[idx].rows, row)
+			} else {
+				kv := map[string]interface{}{}
+				for _, col := range s.GroupBy {
+					kv[col] = row[col]
+				}
+				groupIndex[key] = len(groups)
+				groups = append(groups, &group{keyVals: kv, rows: []storage.Row{row}})
+			}
+		}
+	}
+
+	// Collect all aggregate specs needed (SELECT + HAVING).
+	needed := map[string]aggSpec{}
+	for _, expr := range s.Exprs {
+		if agg, ok := expr.(*parser.AggSelectExpr); ok {
+			k := agg.Func + "(" + agg.Arg + ")"
+			needed[k] = aggSpec{agg.Func, agg.Arg}
+		}
+	}
+	collectAggFuncs(s.Having, needed)
+
+	// Build synthetic row per group and compute aggregates.
+	var synthRows []storage.Row
+	for _, g := range groups {
+		sr := storage.Row{}
+		for k, v := range g.keyVals {
+			sr[k] = v
+		}
+		for key, spec := range needed {
+			val, err := computeAgg(spec.fn, spec.arg, g.rows)
+			if err != nil {
+				return nil, err
+			}
+			sr[key] = val
+		}
+		synthRows = append(synthRows, sr)
+	}
+
+	// Apply HAVING.
+	if s.Having != nil {
+		var passed []storage.Row
+		for _, sr := range synthRows {
+			match, err := evalExpr(s.Having, sr)
+			if err != nil {
+				return nil, err
+			}
+			if boolVal(match) {
+				passed = append(passed, sr)
+			}
+		}
+		synthRows = passed
+	}
+
+	// Project output columns.
+	var colNames []string
+	if s.Exprs == nil {
+		for _, c := range cols {
+			colNames = append(colNames, c.Name)
+		}
+	} else {
+		for _, expr := range s.Exprs {
+			switch ex := expr.(type) {
+			case *parser.ColSelectExpr:
+				colNames = append(colNames, ex.Col)
+			case *parser.AggSelectExpr:
+				colNames = append(colNames, ex.Func+"("+ex.Arg+")")
+			}
+		}
+	}
+
+	result := &Result{Columns: colNames, Rows: [][]interface{}{}}
+	for _, sr := range synthRows {
+		r := make([]interface{}, len(colNames))
+		for i, col := range colNames {
+			r[i] = sr[col]
+		}
+		result.Rows = append(result.Rows, r)
+	}
+
+	groupByDesc := joinStrings(s.GroupBy)
+	if groupByDesc == "" {
+		groupByDesc = "(none)"
+	}
+	havingDesc := "none"
+	if s.Having != nil {
+		havingDesc = ExprString(s.Having)
+	}
+	result.Trace = []string{
+		fmt.Sprintf("Scan %q — %d row(s)", s.Table, len(rows)),
+		fmt.Sprintf("WHERE — %d row(s) after filter", len(filtered)),
+		fmt.Sprintf("GROUP BY [%s] — %d group(s) formed", groupByDesc, len(groups)),
+		fmt.Sprintf("Compute aggregates: %s", formatAggKeys(needed)),
+		fmt.Sprintf("HAVING %s — %d group(s) passed", havingDesc, len(synthRows)),
+		fmt.Sprintf("Project %d column(s) → %d row(s)", len(colNames), len(result.Rows)),
+	}
+	return result, nil
+}
+
+func collectAggFuncs(expr parser.Expression, into map[string]aggSpec) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *parser.AggFuncExpr:
+		arg := "*"
+		if e.Arg != nil {
+			arg = ExprString(e.Arg)
+		}
+		key := e.Func + "(" + arg + ")"
+		into[key] = aggSpec{e.Func, arg}
+	case *parser.BinaryExpr:
+		collectAggFuncs(e.Left, into)
+		collectAggFuncs(e.Right, into)
+	}
+}
+
+func computeAgg(fn, arg string, rows []storage.Row) (interface{}, error) {
+	switch fn {
+	case "COUNT":
+		if arg == "*" {
+			return int64(len(rows)), nil
+		}
+		var count int64
+		for _, row := range rows {
+			if row[arg] != nil {
+				count++
+			}
+		}
+		return count, nil
+	case "SUM":
+		var sum float64
+		for _, row := range rows {
+			f, ok := toFloat(row[arg])
+			if !ok {
+				return nil, fmt.Errorf("SUM: column %q is not numeric", arg)
+			}
+			sum += f
+		}
+		return sum, nil
+	case "AVG":
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		var sum float64
+		for _, row := range rows {
+			f, ok := toFloat(row[arg])
+			if !ok {
+				return nil, fmt.Errorf("AVG: column %q is not numeric", arg)
+			}
+			sum += f
+		}
+		return sum / float64(len(rows)), nil
+	case "MIN":
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		minVal := rows[0][arg]
+		for _, row := range rows[1:] {
+			v := row[arg]
+			lf, lok := toFloat(minVal)
+			rf, rok := toFloat(v)
+			if lok && rok {
+				if rf < lf {
+					minVal = v
+				}
+			} else if fmt.Sprintf("%v", v) < fmt.Sprintf("%v", minVal) {
+				minVal = v
+			}
+		}
+		return minVal, nil
+	case "MAX":
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		maxVal := rows[0][arg]
+		for _, row := range rows[1:] {
+			v := row[arg]
+			lf, lok := toFloat(maxVal)
+			rf, rok := toFloat(v)
+			if lok && rok {
+				if rf > lf {
+					maxVal = v
+				}
+			} else if fmt.Sprintf("%v", v) > fmt.Sprintf("%v", maxVal) {
+				maxVal = v
+			}
+		}
+		return maxVal, nil
+	}
+	return nil, fmt.Errorf("unknown aggregate function %q", fn)
+}
+
+func formatAggKeys(m map[string]aggSpec) string {
+	if len(m) == 0 {
+		return "none"
+	}
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return joinStrings(keys)
 }
 
 func boolVal(v interface{}) bool {

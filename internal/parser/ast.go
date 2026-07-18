@@ -5,6 +5,21 @@ type Statement interface {
 	statementNode()
 }
 
+// SelectExpr is an item in the SELECT column list.
+type SelectExpr interface{ selectExprNode() }
+
+// ColSelectExpr is a plain column reference: "col", "alias.col", "alias.*".
+type ColSelectExpr struct{ Col string }
+
+// AggSelectExpr is an aggregate in the SELECT list: COUNT(*), SUM(col), etc.
+type AggSelectExpr struct {
+	Func string // COUNT, SUM, AVG, MIN, MAX
+	Arg  string // column name or "*"
+}
+
+func (e *ColSelectExpr) selectExprNode() {}
+func (e *AggSelectExpr) selectExprNode() {}
+
 type JoinType string
 
 const (
@@ -20,11 +35,13 @@ type JoinClause struct {
 }
 
 type SelectStatement struct {
-	Columns []string // nil = SELECT *, otherwise bare "col", "alias.col", or "alias.*"
+	Exprs   []SelectExpr // nil = SELECT *
 	Table   string
-	Alias   string // table alias; defaults to table name
+	Alias   string // defaults to table name
 	Joins   []JoinClause
 	Where   Expression
+	GroupBy []string
+	Having  Expression
 }
 
 type InsertStatement struct {
@@ -66,7 +83,7 @@ func (s *DeleteStatement) statementNode()      {}
 func (s *CreateTableStatement) statementNode() {}
 func (s *DropTableStatement) statementNode()   {}
 
-// Expression nodes used in WHERE clauses and assignments.
+// Expression nodes used in WHERE / HAVING clauses.
 type Expression interface {
 	expressionNode()
 }
@@ -78,7 +95,7 @@ type BinaryExpr struct {
 	Right Expression
 }
 
-// IdentExpr is a column reference like `age`, `name`, or qualified `alias.col`.
+// IdentExpr is a column reference like `age` or qualified `alias.col`.
 type IdentExpr struct {
 	Table string // optional alias qualifier
 	Name  string
@@ -89,6 +106,13 @@ type LiteralExpr struct {
 	Value interface{}
 }
 
+// AggFuncExpr is an aggregate function used in HAVING: COUNT(*), AVG(col), etc.
+type AggFuncExpr struct {
+	Func string     // COUNT, SUM, AVG, MIN, MAX
+	Arg  Expression // nil means COUNT(*)
+}
+
 func (e *BinaryExpr) expressionNode()  {}
 func (e *IdentExpr) expressionNode()   {}
 func (e *LiteralExpr) expressionNode() {}
+func (e *AggFuncExpr) expressionNode() {}

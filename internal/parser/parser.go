@@ -35,6 +35,8 @@ func (p *Parser) Parse() (Statement, error) {
 	}
 }
 
+// --- token primitives ---
+
 func (p *Parser) current() lexer.Token {
 	if p.pos >= len(p.tokens) {
 		return lexer.Token{Type: lexer.EOF}
@@ -57,21 +59,102 @@ func (p *Parser) expect(tt lexer.TokenType) (lexer.Token, error) {
 	return t, nil
 }
 
-// parseSelect handles: SELECT cols FROM table [alias] [JOIN ...] [WHERE expr] [GROUP BY cols] [HAVING expr]
+func (p *Parser) is(tt lexer.TokenType) bool {
+	return p.current().Type == tt
+}
+
+// --- shared helpers ---
+
+func isAggFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		return true
+	}
+	return false
+}
+
+// parseOptionalAlias consumes [AS] ident or a bare ident alias, falling back to fallback.
+func (p *Parser) parseOptionalAlias(fallback, ctx string) (string, error) {
+	if p.is(lexer.AS) {
+		p.advance()
+		a, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return "", fmt.Errorf("%s: expected alias after AS", ctx)
+		}
+		return a.Literal, nil
+	}
+	if p.is(lexer.IDENT) {
+		return p.advance().Literal, nil
+	}
+	return fallback, nil
+}
+
+// parseOptionalWhere consumes WHERE expr if present.
+func (p *Parser) parseOptionalWhere() (Expression, error) {
+	if !p.is(lexer.WHERE) {
+		return nil, nil
+	}
+	p.advance()
+	return p.parseExpression()
+}
+
+// parseAggParen consumes (col_or_star) for an aggregate and returns the arg string.
+func (p *Parser) parseAggParen(fn string) (string, error) {
+	p.advance() // consume (
+	arg := "*"
+	if p.is(lexer.ASTERISK) {
+		p.advance()
+	} else {
+		col, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return "", fmt.Errorf("%s: expected column or *", fn)
+		}
+		arg = col.Literal
+		if p.is(lexer.DOT) {
+			p.advance()
+			col2, err := p.expect(lexer.IDENT)
+			if err != nil {
+				return "", fmt.Errorf("%s: expected column after .", fn)
+			}
+			arg = col.Literal + "." + col2.Literal
+		}
+	}
+	if _, err := p.expect(lexer.RPAREN); err != nil {
+		return "", fmt.Errorf("%s: expected )", fn)
+	}
+	return arg, nil
+}
+
+// parseIntKeyword consumes keyword + integer literal. Returns nil if keyword not present.
+func (p *Parser) parseIntKeyword(kw lexer.TokenType, name string) (*int64, error) {
+	if !p.is(kw) {
+		return nil, nil
+	}
+	p.advance()
+	val, err := p.parseLiteral()
+	if err != nil {
+		return nil, fmt.Errorf("%s: expected integer", name)
+	}
+	n, ok := val.(int64)
+	if !ok {
+		return nil, fmt.Errorf("%s: expected integer, got %T", name, val)
+	}
+	return &n, nil
+}
+
+// --- statement parsers ---
+
 func (p *Parser) parseSelect() (*SelectStatement, error) {
 	p.advance() // consume SELECT
 	stmt := &SelectStatement{}
 
-	// Optional DISTINCT
-	if p.current().Type == lexer.DISTINCT {
+	if p.is(lexer.DISTINCT) {
 		stmt.Distinct = true
 		p.advance()
 	}
 
-	// Column list: *, alias.*, alias.col, col, COUNT(*), SUM(col), ...
-	if p.current().Type == lexer.ASTERISK {
-		stmt.Exprs = nil // SELECT *
-		p.advance()
+	if p.is(lexer.ASTERISK) {
+		p.advance() // SELECT *
 	} else {
 		for {
 			expr, err := p.parseSelectColumn()
@@ -79,7 +162,7 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 				return nil, err
 			}
 			stmt.Exprs = append(stmt.Exprs, expr)
-			if p.current().Type != lexer.COMMA {
+			if !p.is(lexer.COMMA) {
 				break
 			}
 			p.advance()
@@ -94,24 +177,11 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 		return nil, fmt.Errorf("SELECT: expected table name")
 	}
 	stmt.Table = t.Literal
-	stmt.Alias = t.Literal // default alias = table name
-
-	// Optional alias: FROM table [AS] alias
-	if p.current().Type == lexer.AS {
-		p.advance()
-		a, err := p.expect(lexer.IDENT)
-		if err != nil {
-			return nil, fmt.Errorf("SELECT FROM: expected alias after AS")
-		}
-		stmt.Alias = a.Literal
-	} else if p.current().Type == lexer.IDENT {
-		stmt.Alias = p.advance().Literal
+	if stmt.Alias, err = p.parseOptionalAlias(t.Literal, "SELECT FROM"); err != nil {
+		return nil, err
 	}
 
-	// JOIN clauses
-	for p.current().Type == lexer.JOIN ||
-		p.current().Type == lexer.INNER ||
-		p.current().Type == lexer.LEFT {
+	for p.is(lexer.JOIN) || p.is(lexer.INNER) || p.is(lexer.LEFT) {
 		join, err := p.parseJoin()
 		if err != nil {
 			return nil, err
@@ -119,17 +189,12 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 		stmt.Joins = append(stmt.Joins, join)
 	}
 
-	if p.current().Type == lexer.WHERE {
-		p.advance()
-		expr, err := p.parseExpression()
-		if err != nil {
-			return nil, err
-		}
-		stmt.Where = expr
+	if stmt.Where, err = p.parseOptionalWhere(); err != nil {
+		return nil, err
 	}
 
-	if p.current().Type == lexer.GROUP {
-		p.advance() // consume GROUP
+	if p.is(lexer.GROUP) {
+		p.advance()
 		if _, err := p.expect(lexer.BY); err != nil {
 			return nil, fmt.Errorf("SELECT: expected BY after GROUP")
 		}
@@ -139,24 +204,22 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 				return nil, fmt.Errorf("GROUP BY: expected column name")
 			}
 			stmt.GroupBy = append(stmt.GroupBy, col.Literal)
-			if p.current().Type != lexer.COMMA {
+			if !p.is(lexer.COMMA) {
 				break
 			}
 			p.advance()
 		}
 	}
 
-	if p.current().Type == lexer.HAVING {
+	if p.is(lexer.HAVING) {
 		p.advance()
-		expr, err := p.parseExpression()
-		if err != nil {
+		if stmt.Having, err = p.parseExpression(); err != nil {
 			return nil, err
 		}
-		stmt.Having = expr
 	}
 
-	if p.current().Type == lexer.ORDER {
-		p.advance() // consume ORDER
+	if p.is(lexer.ORDER) {
+		p.advance()
 		if _, err := p.expect(lexer.BY); err != nil {
 			return nil, fmt.Errorf("SELECT: expected BY after ORDER")
 		}
@@ -166,124 +229,65 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 				return nil, err
 			}
 			stmt.OrderBy = append(stmt.OrderBy, col)
-			if p.current().Type != lexer.COMMA {
+			if !p.is(lexer.COMMA) {
 				break
 			}
 			p.advance()
 		}
 	}
 
-	if p.current().Type == lexer.LIMIT {
-		p.advance()
-		val, err := p.parseLiteral()
-		if err != nil {
-			return nil, fmt.Errorf("LIMIT: expected integer")
-		}
-		n, ok := val.(int64)
-		if !ok {
-			return nil, fmt.Errorf("LIMIT: expected integer, got %T", val)
-		}
-		stmt.Limit = &n
+	if stmt.Limit, err = p.parseIntKeyword(lexer.LIMIT, "LIMIT"); err != nil {
+		return nil, err
 	}
-
-	if p.current().Type == lexer.OFFSET {
-		p.advance()
-		val, err := p.parseLiteral()
-		if err != nil {
-			return nil, fmt.Errorf("OFFSET: expected integer")
-		}
-		n, ok := val.(int64)
-		if !ok {
-			return nil, fmt.Errorf("OFFSET: expected integer, got %T", val)
-		}
-		stmt.Offset = &n
+	if stmt.Offset, err = p.parseIntKeyword(lexer.OFFSET, "OFFSET"); err != nil {
+		return nil, err
 	}
 
 	return stmt, nil
 }
 
-// parseOrderByCol parses one ORDER BY item: col [ASC|DESC] or aggfunc(...) [ASC|DESC]
 func (p *Parser) parseOrderByCol() (OrderByExpr, error) {
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
 		return OrderByExpr{}, fmt.Errorf("ORDER BY: expected column name")
 	}
 	col := t.Literal
-	// Aggregate function in ORDER BY: COUNT(*), SUM(col), etc.
-	if p.current().Type == lexer.LPAREN {
+	if p.is(lexer.LPAREN) && isAggFunc(col) {
 		fn := strings.ToUpper(col)
-		switch fn {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX":
-			p.advance() // consume (
-			arg := "*"
-			if p.current().Type == lexer.ASTERISK {
-				p.advance()
-			} else {
-				c, err := p.expect(lexer.IDENT)
-				if err != nil {
-					return OrderByExpr{}, fmt.Errorf("ORDER BY %s: expected column or *", fn)
-				}
-				arg = c.Literal
-			}
-			if _, err := p.expect(lexer.RPAREN); err != nil {
-				return OrderByExpr{}, fmt.Errorf("ORDER BY %s: expected )", fn)
-			}
-			col = fn + "(" + arg + ")"
+		arg, err := p.parseAggParen(fn)
+		if err != nil {
+			return OrderByExpr{}, err
 		}
+		col = fn + "(" + arg + ")"
 	}
 	desc := false
-	if p.current().Type == lexer.DESC {
+	if p.is(lexer.DESC) {
 		desc = true
 		p.advance()
-	} else if p.current().Type == lexer.ASC {
+	} else if p.is(lexer.ASC) {
 		p.advance()
 	}
 	return OrderByExpr{Col: col, Desc: desc}, nil
 }
 
-// parseSelectColumn parses a single item in the SELECT list.
-// Supports: col, alias.col, alias.*, COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
 func (p *Parser) parseSelectColumn() (SelectExpr, error) {
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
 		return nil, fmt.Errorf("SELECT: expected column name or aggregate, got %q", p.current().Literal)
 	}
 
-	// Aggregate function: IDENT(...)
-	if p.current().Type == lexer.LPAREN {
+	if p.is(lexer.LPAREN) && isAggFunc(t.Literal) {
 		fn := strings.ToUpper(t.Literal)
-		switch fn {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX":
-			p.advance() // consume (
-			arg := "*"
-			if p.current().Type == lexer.ASTERISK {
-				p.advance() // consume *
-			} else {
-				col, err := p.expect(lexer.IDENT)
-				if err != nil {
-					return nil, fmt.Errorf("%s: expected column or *", fn)
-				}
-				arg = col.Literal
-				if p.current().Type == lexer.DOT {
-					p.advance()
-					col2, err := p.expect(lexer.IDENT)
-					if err != nil {
-						return nil, fmt.Errorf("%s: expected column after .", fn)
-					}
-					arg = col.Literal + "." + col2.Literal
-				}
-			}
-			if _, err := p.expect(lexer.RPAREN); err != nil {
-				return nil, fmt.Errorf("%s: expected )", fn)
-			}
-			return &AggSelectExpr{Func: fn, Arg: arg}, nil
+		arg, err := p.parseAggParen(fn)
+		if err != nil {
+			return nil, err
 		}
+		return &AggSelectExpr{Func: fn, Arg: arg}, nil
 	}
 
-	// Plain column reference: col, alias.col, alias.*
-	if p.current().Type == lexer.DOT {
-		p.advance() // consume dot
-		if p.current().Type == lexer.ASTERISK {
+	if p.is(lexer.DOT) {
+		p.advance()
+		if p.is(lexer.ASTERISK) {
 			p.advance()
 			return &ColSelectExpr{Col: t.Literal + ".*"}, nil
 		}
@@ -296,16 +300,15 @@ func (p *Parser) parseSelectColumn() (SelectExpr, error) {
 	return &ColSelectExpr{Col: t.Literal}, nil
 }
 
-// parseJoin handles: [INNER | LEFT [OUTER]] JOIN table [alias] ON expr
 func (p *Parser) parseJoin() (JoinClause, error) {
 	jt := InnerJoin
-	if p.current().Type == lexer.LEFT {
+	if p.is(lexer.LEFT) {
 		jt = LeftJoin
 		p.advance()
-		if p.current().Type == lexer.OUTER {
-			p.advance() // optional OUTER
+		if p.is(lexer.OUTER) {
+			p.advance()
 		}
-	} else if p.current().Type == lexer.INNER {
+	} else if p.is(lexer.INNER) {
 		p.advance()
 	}
 	if _, err := p.expect(lexer.JOIN); err != nil {
@@ -315,16 +318,9 @@ func (p *Parser) parseJoin() (JoinClause, error) {
 	if err != nil {
 		return JoinClause{}, fmt.Errorf("JOIN: expected table name")
 	}
-	alias := tbl.Literal
-	if p.current().Type == lexer.AS {
-		p.advance()
-		a, err := p.expect(lexer.IDENT)
-		if err != nil {
-			return JoinClause{}, fmt.Errorf("JOIN: expected alias after AS")
-		}
-		alias = a.Literal
-	} else if p.current().Type == lexer.IDENT {
-		alias = p.advance().Literal
+	alias, err := p.parseOptionalAlias(tbl.Literal, "JOIN")
+	if err != nil {
+		return JoinClause{}, err
 	}
 	if _, err := p.expect(lexer.ON); err != nil {
 		return JoinClause{}, fmt.Errorf("JOIN: expected ON")
@@ -336,7 +332,6 @@ func (p *Parser) parseJoin() (JoinClause, error) {
 	return JoinClause{Type: jt, Table: tbl.Literal, Alias: alias, Condition: cond}, nil
 }
 
-// parseInsert handles: INSERT INTO table [(cols)] VALUES (vals)
 func (p *Parser) parseInsert() (*InsertStatement, error) {
 	p.advance() // consume INSERT
 	if _, err := p.expect(lexer.INTO); err != nil {
@@ -348,16 +343,15 @@ func (p *Parser) parseInsert() (*InsertStatement, error) {
 	}
 	stmt := &InsertStatement{Table: t.Literal}
 
-	// Optional column list: INSERT INTO t (a, b, c)
-	if p.current().Type == lexer.LPAREN {
+	if p.is(lexer.LPAREN) {
 		p.advance()
-		for p.current().Type != lexer.RPAREN && p.current().Type != lexer.EOF {
+		for !p.is(lexer.RPAREN) && !p.is(lexer.EOF) {
 			col, err := p.expect(lexer.IDENT)
 			if err != nil {
 				return nil, fmt.Errorf("INSERT: expected column name")
 			}
 			stmt.Columns = append(stmt.Columns, col.Literal)
-			if p.current().Type == lexer.COMMA {
+			if p.is(lexer.COMMA) {
 				p.advance()
 			}
 		}
@@ -372,39 +366,33 @@ func (p *Parser) parseInsert() (*InsertStatement, error) {
 	if _, err := p.expect(lexer.LPAREN); err != nil {
 		return nil, fmt.Errorf("INSERT: expected ( before values")
 	}
-	for p.current().Type != lexer.RPAREN && p.current().Type != lexer.EOF {
+	for !p.is(lexer.RPAREN) && !p.is(lexer.EOF) {
 		val, err := p.parseLiteral()
 		if err != nil {
 			return nil, fmt.Errorf("INSERT: %w", err)
 		}
 		stmt.Values = append(stmt.Values, val)
-		if p.current().Type == lexer.COMMA {
+		if p.is(lexer.COMMA) {
 			p.advance()
 		}
 	}
 	if _, err := p.expect(lexer.RPAREN); err != nil {
 		return nil, fmt.Errorf("INSERT: expected ) after values")
 	}
-
 	return stmt, nil
 }
 
-// parseUpdate handles: UPDATE table SET col=val [, col=val] [WHERE expr]
 func (p *Parser) parseUpdate() (*UpdateStatement, error) {
 	p.advance() // consume UPDATE
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
 		return nil, fmt.Errorf("UPDATE: expected table name")
 	}
-	stmt := &UpdateStatement{
-		Table:       t.Literal,
-		Assignments: make(map[string]interface{}),
-	}
+	stmt := &UpdateStatement{Table: t.Literal, Assignments: make(map[string]interface{})}
 
 	if _, err := p.expect(lexer.SET); err != nil {
 		return nil, fmt.Errorf("UPDATE: expected SET")
 	}
-
 	for {
 		col, err := p.expect(lexer.IDENT)
 		if err != nil {
@@ -418,25 +406,17 @@ func (p *Parser) parseUpdate() (*UpdateStatement, error) {
 			return nil, fmt.Errorf("UPDATE: %w", err)
 		}
 		stmt.Assignments[col.Literal] = val
-		if p.current().Type != lexer.COMMA {
+		if !p.is(lexer.COMMA) {
 			break
 		}
 		p.advance()
 	}
-
-	if p.current().Type == lexer.WHERE {
-		p.advance()
-		expr, err := p.parseExpression()
-		if err != nil {
-			return nil, err
-		}
-		stmt.Where = expr
+	if stmt.Where, err = p.parseOptionalWhere(); err != nil {
+		return nil, err
 	}
-
 	return stmt, nil
 }
 
-// parseDelete handles: DELETE FROM table [WHERE expr]
 func (p *Parser) parseDelete() (*DeleteStatement, error) {
 	p.advance() // consume DELETE
 	if _, err := p.expect(lexer.FROM); err != nil {
@@ -446,21 +426,13 @@ func (p *Parser) parseDelete() (*DeleteStatement, error) {
 	if err != nil {
 		return nil, fmt.Errorf("DELETE: expected table name")
 	}
-	stmt := &DeleteStatement{Table: t.Literal}
-
-	if p.current().Type == lexer.WHERE {
-		p.advance()
-		expr, err := p.parseExpression()
-		if err != nil {
-			return nil, err
-		}
-		stmt.Where = expr
+	where, err := p.parseOptionalWhere()
+	if err != nil {
+		return nil, err
 	}
-
-	return stmt, nil
+	return &DeleteStatement{Table: t.Literal, Where: where}, nil
 }
 
-// parseCreate handles: CREATE TABLE name (col type [PRIMARY KEY], ...)
 func (p *Parser) parseCreate() (*CreateTableStatement, error) {
 	p.advance() // consume CREATE
 	if _, err := p.expect(lexer.TABLE); err != nil {
@@ -475,20 +447,19 @@ func (p *Parser) parseCreate() (*CreateTableStatement, error) {
 	if _, err := p.expect(lexer.LPAREN); err != nil {
 		return nil, fmt.Errorf("CREATE TABLE: expected (")
 	}
-	for p.current().Type != lexer.RPAREN && p.current().Type != lexer.EOF {
+	for !p.is(lexer.RPAREN) && !p.is(lexer.EOF) {
 		col, err := p.parseColumnDef()
 		if err != nil {
 			return nil, err
 		}
 		stmt.Columns = append(stmt.Columns, col)
-		if p.current().Type == lexer.COMMA {
+		if p.is(lexer.COMMA) {
 			p.advance()
 		}
 	}
 	if _, err := p.expect(lexer.RPAREN); err != nil {
 		return nil, fmt.Errorf("CREATE TABLE: expected )")
 	}
-
 	return stmt, nil
 }
 
@@ -497,23 +468,17 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	if err != nil {
 		return ColumnDef{}, fmt.Errorf("column def: expected column name")
 	}
-	typeToken := p.advance()
-	typeName := strings.ToUpper(typeToken.Literal)
-
-	col := ColumnDef{Name: name.Literal, Type: typeName}
-
-	if p.current().Type == lexer.PRIMARY {
+	col := ColumnDef{Name: name.Literal, Type: strings.ToUpper(p.advance().Literal)}
+	if p.is(lexer.PRIMARY) {
 		p.advance()
 		if _, err := p.expect(lexer.KEY); err != nil {
 			return ColumnDef{}, fmt.Errorf("column def: expected KEY after PRIMARY")
 		}
 		col.Primary = true
 	}
-
 	return col, nil
 }
 
-// parseDrop handles: DROP TABLE name
 func (p *Parser) parseDrop() (*DropTableStatement, error) {
 	p.advance() // consume DROP
 	if _, err := p.expect(lexer.TABLE); err != nil {
@@ -526,17 +491,16 @@ func (p *Parser) parseDrop() (*DropTableStatement, error) {
 	return &DropTableStatement{Table: t.Literal}, nil
 }
 
-// Expression parsing uses recursive descent: OR > AND > comparison > primary.
-func (p *Parser) parseExpression() (Expression, error) {
-	return p.parseOr()
-}
+// --- expression parsing: OR > AND > comparison > primary ---
+
+func (p *Parser) parseExpression() (Expression, error) { return p.parseOr() }
 
 func (p *Parser) parseOr() (Expression, error) {
 	left, err := p.parseAnd()
 	if err != nil {
 		return nil, err
 	}
-	for p.current().Type == lexer.OR {
+	for p.is(lexer.OR) {
 		p.advance()
 		right, err := p.parseAnd()
 		if err != nil {
@@ -552,7 +516,7 @@ func (p *Parser) parseAnd() (Expression, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.current().Type == lexer.AND {
+	for p.is(lexer.AND) {
 		p.advance()
 		right, err := p.parseComparison()
 		if err != nil {
@@ -582,33 +546,27 @@ func (p *Parser) parseComparison() (Expression, error) {
 
 func (p *Parser) parsePrimary() (Expression, error) {
 	t := p.current()
-	if t.Type == lexer.IDENT {
+	if p.is(lexer.IDENT) {
 		p.advance()
-		// Aggregate function in expression context: COUNT(*), AVG(col), etc. (used in HAVING)
-		if p.current().Type == lexer.LPAREN {
+		if p.is(lexer.LPAREN) && isAggFunc(t.Literal) {
 			fn := strings.ToUpper(t.Literal)
-			switch fn {
-			case "COUNT", "SUM", "AVG", "MIN", "MAX":
-				p.advance() // consume (
-				var arg Expression
-				if p.current().Type == lexer.ASTERISK {
-					p.advance() // consume * — arg stays nil (meaning *)
-				} else {
-					var err error
-					arg, err = p.parseExpression()
-					if err != nil {
-						return nil, err
-					}
+			p.advance() // consume (
+			var arg Expression
+			if p.is(lexer.ASTERISK) {
+				p.advance()
+			} else {
+				var err error
+				if arg, err = p.parseExpression(); err != nil {
+					return nil, err
 				}
-				if _, err := p.expect(lexer.RPAREN); err != nil {
-					return nil, fmt.Errorf("%s(): expected )", fn)
-				}
-				return &AggFuncExpr{Func: fn, Arg: arg}, nil
 			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("%s(): expected )", fn)
+			}
+			return &AggFuncExpr{Func: fn, Arg: arg}, nil
 		}
-		// Check for qualified ref: alias.col
-		if p.current().Type == lexer.DOT {
-			p.advance() // consume dot
+		if p.is(lexer.DOT) {
+			p.advance()
 			col, err := p.expect(lexer.IDENT)
 			if err != nil {
 				return nil, fmt.Errorf("expected column name after %q.", t.Literal)

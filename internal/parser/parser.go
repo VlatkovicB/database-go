@@ -62,6 +62,12 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 	p.advance() // consume SELECT
 	stmt := &SelectStatement{}
 
+	// Optional DISTINCT
+	if p.current().Type == lexer.DISTINCT {
+		stmt.Distinct = true
+		p.advance()
+	}
+
 	// Column list: *, alias.*, alias.col, col, COUNT(*), SUM(col), ...
 	if p.current().Type == lexer.ASTERISK {
 		stmt.Exprs = nil // SELECT *
@@ -149,7 +155,90 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 		stmt.Having = expr
 	}
 
+	if p.current().Type == lexer.ORDER {
+		p.advance() // consume ORDER
+		if _, err := p.expect(lexer.BY); err != nil {
+			return nil, fmt.Errorf("SELECT: expected BY after ORDER")
+		}
+		for {
+			col, err := p.parseOrderByCol()
+			if err != nil {
+				return nil, err
+			}
+			stmt.OrderBy = append(stmt.OrderBy, col)
+			if p.current().Type != lexer.COMMA {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	if p.current().Type == lexer.LIMIT {
+		p.advance()
+		val, err := p.parseLiteral()
+		if err != nil {
+			return nil, fmt.Errorf("LIMIT: expected integer")
+		}
+		n, ok := val.(int64)
+		if !ok {
+			return nil, fmt.Errorf("LIMIT: expected integer, got %T", val)
+		}
+		stmt.Limit = &n
+	}
+
+	if p.current().Type == lexer.OFFSET {
+		p.advance()
+		val, err := p.parseLiteral()
+		if err != nil {
+			return nil, fmt.Errorf("OFFSET: expected integer")
+		}
+		n, ok := val.(int64)
+		if !ok {
+			return nil, fmt.Errorf("OFFSET: expected integer, got %T", val)
+		}
+		stmt.Offset = &n
+	}
+
 	return stmt, nil
+}
+
+// parseOrderByCol parses one ORDER BY item: col [ASC|DESC] or aggfunc(...) [ASC|DESC]
+func (p *Parser) parseOrderByCol() (OrderByExpr, error) {
+	t, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return OrderByExpr{}, fmt.Errorf("ORDER BY: expected column name")
+	}
+	col := t.Literal
+	// Aggregate function in ORDER BY: COUNT(*), SUM(col), etc.
+	if p.current().Type == lexer.LPAREN {
+		fn := strings.ToUpper(col)
+		switch fn {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+			p.advance() // consume (
+			arg := "*"
+			if p.current().Type == lexer.ASTERISK {
+				p.advance()
+			} else {
+				c, err := p.expect(lexer.IDENT)
+				if err != nil {
+					return OrderByExpr{}, fmt.Errorf("ORDER BY %s: expected column or *", fn)
+				}
+				arg = c.Literal
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return OrderByExpr{}, fmt.Errorf("ORDER BY %s: expected )", fn)
+			}
+			col = fn + "(" + arg + ")"
+		}
+	}
+	desc := false
+	if p.current().Type == lexer.DESC {
+		desc = true
+		p.advance()
+	} else if p.current().Type == lexer.ASC {
+		p.advance()
+	}
+	return OrderByExpr{Col: col, Desc: desc}, nil
 }
 
 // parseSelectColumn parses a single item in the SELECT list.

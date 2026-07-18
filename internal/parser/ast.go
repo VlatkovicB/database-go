@@ -34,14 +34,23 @@ type JoinClause struct {
 	Condition Expression
 }
 
+type OrderByExpr struct {
+	Col  string // column name or aggregate key e.g. "COUNT(*)"
+	Desc bool
+}
+
 type SelectStatement struct {
-	Exprs   []SelectExpr // nil = SELECT *
-	Table   string
-	Alias   string // defaults to table name
-	Joins   []JoinClause
-	Where   Expression
-	GroupBy []string
-	Having  Expression
+	Distinct bool
+	Exprs    []SelectExpr // nil = SELECT *
+	Table    string
+	Alias    string // defaults to table name
+	Joins    []JoinClause
+	Where    Expression
+	GroupBy  []string
+	Having   Expression
+	OrderBy  []OrderByExpr
+	Limit    *int64
+	Offset   *int64
 }
 
 type InsertStatement struct {

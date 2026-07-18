@@ -4,6 +4,7 @@ import (
 	"database/internal/parser"
 	"database/internal/storage"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -121,6 +122,7 @@ func (e *Executor) execSelectSingle(s *parser.SelectStatement) (*Result, error) 
 		}
 		result.Rows = append(result.Rows, r)
 	}
+	postProcess(result, s)
 	return result, nil
 }
 
@@ -303,6 +305,7 @@ func (e *Executor) execSelectJoin(s *parser.SelectStatement) (*Result, error) {
 		}
 		result.Rows = append(result.Rows, r)
 	}
+	postProcess(result, s)
 	return result, nil
 }
 
@@ -722,6 +725,7 @@ func (e *Executor) execSelectGroupBy(s *parser.SelectStatement) (*Result, error)
 		}
 		result.Rows = append(result.Rows, r)
 	}
+	postProcess(result, s)
 
 	groupByDesc := joinStrings(s.GroupBy)
 	if groupByDesc == "" {
@@ -834,6 +838,109 @@ func computeAgg(fn, arg string, rows []storage.Row) (interface{}, error) {
 		return maxVal, nil
 	}
 	return nil, fmt.Errorf("unknown aggregate function %q", fn)
+}
+
+func postProcess(result *Result, s *parser.SelectStatement) {
+	if s.Distinct {
+		applyDistinct(result)
+		result.Trace = append(result.Trace, fmt.Sprintf("DISTINCT — %d unique row(s)", len(result.Rows)))
+	}
+	if len(s.OrderBy) > 0 {
+		applyOrderBy(result, s.OrderBy)
+		cols := make([]string, len(s.OrderBy))
+		for i, ob := range s.OrderBy {
+			dir := "ASC"
+			if ob.Desc {
+				dir = "DESC"
+			}
+			cols[i] = ob.Col + " " + dir
+		}
+		result.Trace = append(result.Trace, fmt.Sprintf("ORDER BY %s", joinStrings(cols)))
+	}
+	if s.Offset != nil || s.Limit != nil {
+		total := len(result.Rows)
+		applyLimitOffset(result, s.Limit, s.Offset)
+		result.Trace = append(result.Trace, fmt.Sprintf("LIMIT/OFFSET — %d of %d row(s) returned", len(result.Rows), total))
+	}
+}
+
+func applyDistinct(result *Result) {
+	seen := map[string]bool{}
+	var unique [][]interface{}
+	for _, row := range result.Rows {
+		key := fmt.Sprintf("%v", row)
+		if !seen[key] {
+			seen[key] = true
+			unique = append(unique, row)
+		}
+	}
+	result.Rows = unique
+}
+
+func applyOrderBy(result *Result, orderBy []parser.OrderByExpr) {
+	colIdx := map[string]int{}
+	for i, col := range result.Columns {
+		colIdx[col] = i
+	}
+	sort.SliceStable(result.Rows, func(i, j int) bool {
+		for _, ob := range orderBy {
+			idx, ok := colIdx[ob.Col]
+			if !ok {
+				continue
+			}
+			cmp := compareVals(result.Rows[i][idx], result.Rows[j][idx])
+			if cmp == 0 {
+				continue
+			}
+			if ob.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+}
+
+func compareVals(a, b interface{}) int {
+	af, aok := toFloat(a)
+	bf, bok := toFloat(b)
+	if aok && bok {
+		if af < bf {
+			return -1
+		}
+		if af > bf {
+			return 1
+		}
+		return 0
+	}
+	as := fmt.Sprintf("%v", a)
+	bs := fmt.Sprintf("%v", b)
+	if as < bs {
+		return -1
+	}
+	if as > bs {
+		return 1
+	}
+	return 0
+}
+
+func applyLimitOffset(result *Result, limit, offset *int64) {
+	rows := result.Rows
+	if offset != nil && *offset > 0 {
+		o := int(*offset)
+		if o >= len(rows) {
+			result.Rows = [][]interface{}{}
+			return
+		}
+		rows = rows[o:]
+	}
+	if limit != nil {
+		l := int(*limit)
+		if l < len(rows) {
+			rows = rows[:l]
+		}
+	}
+	result.Rows = rows
 }
 
 func formatAggKeys(m map[string]aggSpec) string {

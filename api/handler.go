@@ -138,15 +138,27 @@ func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 				"on":    exprToTrace(j.Condition),
 			})
 		}
+		var orderBy []map[string]interface{}
+		for _, ob := range s.OrderBy {
+			dir := "ASC"
+			if ob.Desc {
+				dir = "DESC"
+			}
+			orderBy = append(orderBy, map[string]interface{}{"col": ob.Col, "dir": dir})
+		}
 		return map[string]interface{}{
-			"type":    "SelectStatement",
-			"table":   s.Table,
-			"alias":   s.Alias,
-			"joins":   joins,
-			"columns": exprList,
-			"where":   exprToTrace(s.Where),
-			"groupBy": s.GroupBy,
-			"having":  exprToTrace(s.Having),
+			"type":     "SelectStatement",
+			"distinct": s.Distinct,
+			"table":    s.Table,
+			"alias":    s.Alias,
+			"joins":    joins,
+			"columns":  exprList,
+			"where":    exprToTrace(s.Where),
+			"groupBy":  s.GroupBy,
+			"having":   exprToTrace(s.Having),
+			"orderBy":  orderBy,
+			"limit":    s.Limit,
+			"offset":   s.Offset,
 		}
 	case *parser.InsertStatement:
 		cols := interface{}("<positional>")

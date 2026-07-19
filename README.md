@@ -76,6 +76,16 @@ LIMIT 5;
 ANALYZE players;
 -- Shows n_distinct, null_frac, histogram bounds, most common values per column.
 -- After ANALYZE, EXPLAIN row estimates use real statistics instead of fixed fractions.
+
+-- Transactions (like PostgreSQL MVCC)
+BEGIN;
+INSERT INTO players (id, username, level, xp, class) VALUES (99, 'Neo', 50, 5000, 'Mage');
+-- Row is invisible to other connections until you COMMIT
+COMMIT;
+-- or: ROLLBACK;  -- discards all changes in the transaction
+
+VACUUM players;
+-- Reclaims dead tuples left behind by committed DELETEs and UPDATEs.
 ```
 
 ### Column types
@@ -94,10 +104,13 @@ ANALYZE players;
 ## API
 
 ```
-POST /query     {"sql": "..."}  →  {columns, rows, message, tokens, ast, execTrace}
-GET  /tables                    →  {tables: [{name, columns, rowCount}]}
-POST /seed                      →  {ok, errors}   — repopulates all 10 game tables
+POST /query     {"sql": "...", "session_id": "tx-1"}  →  {columns, rows, message, tokens, ast, execTrace, session_id}
+GET  /tables                                           →  {tables: [{name, columns, rowCount}]}
+POST /seed                                             →  {ok, errors}   — repopulates all 10 game tables
+POST /vacuum    {"table": "players"}                   →  {reclaimed: N}
 ```
+
+`session_id` is optional. `BEGIN` creates a session and returns its ID. Pass that ID in subsequent queries to run them in the same transaction. `COMMIT` or `ROLLBACK` closes the session.
 
 ## Project structure
 
@@ -125,6 +138,18 @@ SELECT execution has three paths:
 - Any aggregate or GROUP BY → `execSelectGroupBy`
 
 All three paths finish through `postProcess`: DISTINCT dedup → ORDER BY sort → LIMIT/OFFSET slice.
+
+### MVCC (Phase 5)
+
+Each stored tuple has `Xmin` (inserting transaction ID) and `Xmax` (deleting transaction ID, 0 = live):
+
+- **INSERT** stamps `Xmin = currentXID`
+- **UPDATE** marks old tuple `Xmax = currentXID`, inserts new version with `Xmin = currentXID` — no in-place mutation
+- **DELETE** marks `Xmax = currentXID` — tuple stays on the page until VACUUM
+- **SELECT** filters tuples via snapshot visibility: reads committed state as of `BEGIN` time (snapshot isolation)
+- **VACUUM** physically removes tuples where `Xmax != 0` and the deleting transaction is committed
+
+Single-statement queries auto-commit (`xid=0`, always visible). Multi-statement transactions use HTTP `session_id`.
 
 ### Statistics engine (Phase 4)
 

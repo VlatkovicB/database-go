@@ -107,6 +107,16 @@ type AnalyzeStatement struct {
 	Table string
 }
 
+// Transaction control statements (MVCC Phase 5).
+type BeginStatement    struct{}
+type CommitStatement   struct{}
+type RollbackStatement struct{}
+
+// VacuumStatement reclaims dead tuples from a table.
+type VacuumStatement struct {
+	Table string
+}
+
 func (s *SelectStatement) statementNode()      {}
 func (s *InsertStatement) statementNode()      {}
 func (s *UpdateStatement) statementNode()      {}
@@ -117,6 +127,10 @@ func (s *ExplainStatement) statementNode()     {}
 func (s *CreateIndexStatement) statementNode() {}
 func (s *DropIndexStatement) statementNode()   {}
 func (s *AnalyzeStatement) statementNode()     {}
+func (s *BeginStatement) statementNode()       {}
+func (s *CommitStatement) statementNode()      {}
+func (s *RollbackStatement) statementNode()    {}
+func (s *VacuumStatement) statementNode()      {}
 
 // Expression nodes used in WHERE / HAVING clauses.
 type Expression interface {

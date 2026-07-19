@@ -34,13 +34,15 @@ type seqScan struct {
 	db          *storage.Database
 	table       string
 	alias       string
+	snap        *storage.Snapshot
+	xid         uint64
 	tuples      []storage.Tuple
 	pos         int
 	buffersRead int
 }
 
-func newSeqScan(db *storage.Database, table, alias string) *seqScan {
-	return &seqScan{db: db, table: table, alias: alias}
+func newSeqScan(db *storage.Database, table, alias string, snap *storage.Snapshot, xid uint64) *seqScan {
+	return &seqScan{db: db, table: table, alias: alias, snap: snap, xid: xid}
 }
 
 func (n *seqScan) NodeName() string     { return "Seq Scan on " + n.table }
@@ -49,7 +51,7 @@ func (n *seqScan) BuffersRead() int     { return n.buffersRead }
 func (n *seqScan) ScanTable() string    { return n.table }
 
 func (n *seqScan) Open() error {
-	tuples, _, pageCount, err := n.db.ScanPages(n.table)
+	tuples, _, pageCount, err := n.db.ScanPages(n.table, n.snap, n.xid)
 	if err != nil {
 		return err
 	}
@@ -61,7 +63,7 @@ func (n *seqScan) Open() error {
 			row[pfx+k] = v
 		}
 		row[pfx+"ctid"] = t.CTID()
-		n.tuples[i] = storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row}
+		n.tuples[i] = storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row, Xmin: t.Xmin, Xmax: t.Xmax}
 	}
 	n.buffersRead = pageCount
 	n.pos = 0
@@ -93,12 +95,14 @@ type indexScan struct {
 	loOp        string
 	hi          interface{}
 	hiOp        string
+	snap        *storage.Snapshot
+	xid         uint64
 	tuples      []storage.Tuple
 	pos         int
 	buffersRead int // index depth pages + heap pages touched
 }
 
-func newIndexScan(db *storage.Database, table, alias, indexName, column string, lo interface{}, loOp string, hi interface{}, hiOp string) *indexScan {
+func newIndexScan(db *storage.Database, table, alias, indexName, column string, lo interface{}, loOp string, hi interface{}, hiOp string, snap *storage.Snapshot, xid uint64) *indexScan {
 	return &indexScan{
 		db:        db,
 		table:     table,
@@ -109,6 +113,8 @@ func newIndexScan(db *storage.Database, table, alias, indexName, column string, 
 		loOp:      loOp,
 		hi:        hi,
 		hiOp:      hiOp,
+		snap:      snap,
+		xid:       xid,
 	}
 }
 
@@ -126,14 +132,18 @@ func (n *indexScan) Open() error {
 	}
 	pfx := n.alias + "."
 	pagesHit := make(map[int]struct{})
-	n.tuples = make([]storage.Tuple, len(tuples))
-	for i, t := range tuples {
+	n.tuples = nil
+	for _, t := range tuples {
+		// Apply MVCC visibility filter
+		if !n.db.TupleVisible(t, n.snap, n.xid) {
+			continue
+		}
 		row := make(storage.Row, len(t.Data)+1)
 		for k, v := range t.Data {
 			row[pfx+k] = v
 		}
 		row[pfx+"ctid"] = t.CTID()
-		n.tuples[i] = storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row}
+		n.tuples = append(n.tuples, storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row, Xmin: t.Xmin, Xmax: t.Xmax})
 		pagesHit[t.PageNum] = struct{}{}
 	}
 	n.buffersRead = depth + len(pagesHit)

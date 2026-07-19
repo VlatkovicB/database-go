@@ -16,11 +16,29 @@ type Result struct {
 }
 
 type Executor struct {
-	db *storage.Database
+	db        *storage.Database
+	CurrentTx *storage.Transaction
 }
 
 func New(db *storage.Database) *Executor {
 	return &Executor{db: db}
+}
+
+// currentXID returns the active transaction ID, or 0 for auto-commit mode.
+func (e *Executor) currentXID() uint64 {
+	if e.CurrentTx != nil {
+		return e.CurrentTx.ID
+	}
+	return 0
+}
+
+// currentSnapshot returns a pointer to the active transaction's snapshot,
+// or nil for auto-commit mode.
+func (e *Executor) currentSnapshot() *storage.Snapshot {
+	if e.CurrentTx != nil {
+		return &e.CurrentTx.Snapshot
+	}
+	return nil
 }
 
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
@@ -45,6 +63,14 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.execDropIndex(s)
 	case *parser.AnalyzeStatement:
 		return e.execAnalyze(s)
+	case *parser.BeginStatement:
+		return e.execBegin()
+	case *parser.CommitStatement:
+		return e.execCommit()
+	case *parser.RollbackStatement:
+		return e.execRollback()
+	case *parser.VacuumStatement:
+		return e.execVacuum(s)
 	default:
 		return nil, fmt.Errorf("unknown statement type")
 	}
@@ -212,10 +238,12 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 	// Choose scan strategy: Index Scan (single-table with index) or Seq Scan.
 	var root Node
 	whereHandled := false
+	snap := e.currentSnapshot()
+	xid := e.currentXID()
 
 	if len(sel.Joins) == 0 {
 		if ip := e.findIndexPlan(sel.Table, sel.Where); ip != nil {
-			root = newIndexScan(e.db, sel.Table, alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp)
+			root = newIndexScan(e.db, sel.Table, alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp, snap, xid)
 			if ip.residual != nil {
 				root = newFilterNode(root, ip.residual)
 			}
@@ -223,7 +251,7 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 		}
 	}
 	if root == nil {
-		root = newSeqScan(e.db, sel.Table, alias)
+		root = newSeqScan(e.db, sel.Table, alias, snap, xid)
 	}
 
 	// Joins — each becomes a NestedLoopJoin wrapping the previous root.
@@ -237,7 +265,7 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 			return nil, err
 		}
 		aliasOrder = append(aliasOrder, aliasInfo{ja, jt.Columns})
-		inner := newSeqScan(e.db, j.Table, ja)
+		inner := newSeqScan(e.db, j.Table, ja, snap, xid)
 		root = newNestedLoopJoin(root, inner, j.Condition, j.Type)
 	}
 
@@ -458,19 +486,25 @@ func (e *Executor) execInsert(s *parser.InsertStatement) (*Result, error) {
 		}
 	}
 
-	if err := e.db.Insert(s.Table, row); err != nil {
+	xid := e.currentXID()
+	if err := e.db.Insert(s.Table, row, xid); err != nil {
 		return nil, err
+	}
+	traceXmin := "xmin=0 (auto-commit)"
+	if xid != 0 {
+		traceXmin = fmt.Sprintf("xmin=%d", xid)
 	}
 	return &Result{
 		Message: "1 row inserted",
 		Trace: []string{
 			fmt.Sprintf("Build row from %d value(s)", len(s.Values)),
-			fmt.Sprintf("Append row to %q", s.Table),
+			fmt.Sprintf("Append tuple to %q (%s xmax=0)", s.Table, traceXmin),
 		},
 	}, nil
 }
 
 func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
+	xid := e.currentXID()
 	count, err := e.db.UpdateRows(s.Table,
 		func(row storage.Row) bool {
 			if s.Where == nil {
@@ -479,11 +513,17 @@ func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
 			match, _ := evalExpr(s.Where, row)
 			return boolVal(match)
 		},
-		func(row storage.Row) {
-			for k, v := range s.Assignments {
-				row[k] = v
+		func(row storage.Row) storage.Row {
+			newRow := make(storage.Row, len(row))
+			for k, v := range row {
+				newRow[k] = v
 			}
+			for k, v := range s.Assignments {
+				newRow[k] = v
+			}
+			return newRow
 		},
+		xid,
 	)
 	if err != nil {
 		return nil, err
@@ -492,23 +532,31 @@ func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
 	if s.Where != nil {
 		whereDesc = ExprString(s.Where)
 	}
+	trace := []string{
+		fmt.Sprintf("Scan %q for rows matching WHERE %s", s.Table, whereDesc),
+		fmt.Sprintf("Apply %d assignment(s) to %d matching row(s)", len(s.Assignments), count),
+	}
+	if xid != 0 {
+		trace = append(trace,
+			fmt.Sprintf("MVCC: stamped %d old tuple(s) xmax=%d", count, xid),
+			fmt.Sprintf("MVCC: inserted %d new tuple version(s) xmin=%d", count, xid),
+		)
+	}
 	return &Result{
 		Message: fmt.Sprintf("%d row(s) updated", count),
-		Trace: []string{
-			fmt.Sprintf("Scan %q for rows matching WHERE %s", s.Table, whereDesc),
-			fmt.Sprintf("Apply %d assignment(s) to %d matching row(s)", len(s.Assignments), count),
-		},
+		Trace:   trace,
 	}, nil
 }
 
 func (e *Executor) execDelete(s *parser.DeleteStatement) (*Result, error) {
+	xid := e.currentXID()
 	count, err := e.db.DeleteRows(s.Table, func(row storage.Row) bool {
 		if s.Where == nil {
 			return true
 		}
 		match, _ := evalExpr(s.Where, row)
 		return boolVal(match)
-	})
+	}, xid)
 	if err != nil {
 		return nil, err
 	}
@@ -516,12 +564,17 @@ func (e *Executor) execDelete(s *parser.DeleteStatement) (*Result, error) {
 	if s.Where != nil {
 		whereDesc = ExprString(s.Where)
 	}
+	trace := []string{
+		fmt.Sprintf("Scan %q for rows matching WHERE %s", s.Table, whereDesc),
+	}
+	if xid != 0 {
+		trace = append(trace, fmt.Sprintf("MVCC: stamped %d tuple(s) xmax=%d (soft-delete)", count, xid))
+	} else {
+		trace = append(trace, fmt.Sprintf("Remove %d row(s), keep remainder", count))
+	}
 	return &Result{
 		Message: fmt.Sprintf("%d row(s) deleted", count),
-		Trace: []string{
-			fmt.Sprintf("Scan %q for rows matching WHERE %s", s.Table, whereDesc),
-			fmt.Sprintf("Remove %d row(s), keep remainder", count),
-		},
+		Trace:   trace,
 	}, nil
 }
 
@@ -584,6 +637,79 @@ func (e *Executor) execAnalyze(s *parser.AnalyzeStatement) (*Result, error) {
 	return &Result{
 		Message: fmt.Sprintf("ANALYZE %q — statistics updated", s.Table),
 		Trace:   lines,
+	}, nil
+}
+
+// =============================================================================
+// Transaction control (MVCC Phase 5)
+// =============================================================================
+
+func (e *Executor) execBegin() (*Result, error) {
+	if e.CurrentTx != nil {
+		return nil, fmt.Errorf("there is already an open transaction (xid=%d)", e.CurrentTx.ID)
+	}
+	e.CurrentTx = e.db.TxManager.Begin()
+	return &Result{
+		Message: "BEGIN",
+		Trace: []string{
+			fmt.Sprintf("Assigned xid=%d", e.CurrentTx.ID),
+			fmt.Sprintf("Snapshot: xmin=%d xmax=%d active=%v",
+				e.CurrentTx.Snapshot.Xmin,
+				e.CurrentTx.Snapshot.Xmax,
+				e.CurrentTx.Snapshot.Active),
+		},
+	}, nil
+}
+
+func (e *Executor) execCommit() (*Result, error) {
+	if e.CurrentTx == nil {
+		return nil, fmt.Errorf("there is no open transaction")
+	}
+	xid := e.CurrentTx.ID
+	if err := e.db.TxManager.Commit(xid); err != nil {
+		return nil, err
+	}
+	e.CurrentTx = nil
+	return &Result{
+		Message: "COMMIT",
+		Trace: []string{
+			fmt.Sprintf("xid=%d marked COMMITTED", xid),
+			"Tuple versions written by this tx are now visible to other transactions",
+		},
+	}, nil
+}
+
+func (e *Executor) execRollback() (*Result, error) {
+	if e.CurrentTx == nil {
+		return nil, fmt.Errorf("there is no open transaction")
+	}
+	xid := e.CurrentTx.ID
+	if err := e.db.TxManager.Abort(xid); err != nil {
+		return nil, err
+	}
+	e.CurrentTx = nil
+	return &Result{
+		Message: "ROLLBACK",
+		Trace: []string{
+			fmt.Sprintf("xid=%d marked ABORTED", xid),
+			"Tuple versions written by this tx are invisible (xmin not committed)",
+			"Dead tuples will be reclaimed by VACUUM",
+		},
+	}, nil
+}
+
+func (e *Executor) execVacuum(s *parser.VacuumStatement) (*Result, error) {
+	reclaimed, err := e.db.Vacuum(s.Table)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{
+		Message: fmt.Sprintf("VACUUM %q — %d dead tuple(s) reclaimed", s.Table, reclaimed),
+		Trace: []string{
+			fmt.Sprintf("Scan %q for tuples where xmax != 0 AND xmax is committed", s.Table),
+			fmt.Sprintf("Reclaimed %d dead tuple(s)", reclaimed),
+			"Rebuilt indexes",
+		},
 	}, nil
 }
 

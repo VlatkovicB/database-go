@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 )
 
 type QueryRequest struct {
-	SQL string `json:"sql"`
+	SQL       string `json:"sql"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 type TraceToken struct {
@@ -28,69 +30,165 @@ type QueryResponse struct {
 	Tokens    []TraceToken    `json:"tokens,omitempty"`
 	AST       interface{}     `json:"ast,omitempty"`
 	ExecTrace []string        `json:"execTrace,omitempty"`
+	SessionID string          `json:"session_id,omitempty"`
 }
 
+// Handler holds the shared database and an in-memory session store.
+// Each session maps a session_id string to a stateful Executor that has an
+// open transaction (BEGIN has been called but COMMIT/ROLLBACK not yet).
+type Handler struct {
+	db       *storage.Database
+	mu       sync.Mutex
+	sessions map[string]*executor.Executor
+}
+
+func NewHandler(db *storage.Database) *Handler {
+	return &Handler{
+		db:       db,
+		sessions: make(map[string]*executor.Executor),
+	}
+}
+
+// QueryHandler returns an http.HandlerFunc backed by a Handler with session support.
 func QueryHandler(db *storage.Database) http.HandlerFunc {
-	exec := executor.New(db)
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	h := NewHandler(db)
+	return h.handleQuery
+}
 
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeJSON(w, QueryResponse{Error: "only POST allowed"})
-			return
-		}
+func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		var req QueryRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, QueryResponse{Error: "invalid request body"})
-			return
-		}
-		if req.SQL == "" {
-			writeJSON(w, QueryResponse{Error: "sql is required"})
-			return
-		}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, QueryResponse{Error: "only POST allowed"})
+		return
+	}
 
-		// Stage 1: Lex
-		tokens := lexer.New(req.SQL).Tokenize()
-		traceTokens := serializeTokens(tokens)
+	var req QueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, QueryResponse{Error: "invalid request body"})
+		return
+	}
+	if req.SQL == "" {
+		writeJSON(w, QueryResponse{Error: "sql is required"})
+		return
+	}
 
-		// Stage 2: Parse
-		stmt, err := parser.New(tokens).Parse()
-		if err != nil {
-			writeJSON(w, QueryResponse{
-				Error:  "parse error: " + err.Error(),
-				Tokens: traceTokens,
-			})
-			return
-		}
-		ast := stmtToTrace(stmt)
+	// Stage 1: Lex
+	tokens := lexer.New(req.SQL).Tokenize()
+	traceTokens := serializeTokens(tokens)
 
-		// Stage 3: Execute
+	// Stage 2: Parse
+	stmt, err := parser.New(tokens).Parse()
+	if err != nil {
+		writeJSON(w, QueryResponse{
+			Error:  "parse error: " + err.Error(),
+			Tokens: traceTokens,
+		})
+		return
+	}
+	ast := stmtToTrace(stmt)
+
+	// Stage 3: Resolve executor (session-aware)
+	var exec *executor.Executor
+	var sessionID string
+
+	switch stmt.(type) {
+	case *parser.BeginStatement:
+		// BEGIN: always create a fresh executor, assign session after Begin sets CurrentTx.
+		exec = executor.New(h.db)
 		result, err := exec.Execute(stmt)
 		if err != nil {
-			writeJSON(w, QueryResponse{
-				Error:  err.Error(),
-				Tokens: traceTokens,
-				AST:    ast,
-			})
+			writeJSON(w, QueryResponse{Error: err.Error(), Tokens: traceTokens, AST: ast})
 			return
 		}
-
+		// Store session keyed by tx ID.
+		sessionID = fmt.Sprintf("tx-%d", exec.CurrentTx.ID)
+		h.mu.Lock()
+		h.sessions[sessionID] = exec
+		h.mu.Unlock()
 		writeJSON(w, QueryResponse{
-			Columns:   result.Columns,
-			Rows:      result.Rows,
+			Message:   result.Message,
+			Tokens:    traceTokens,
+			AST:       ast,
+			ExecTrace: result.Trace,
+			SessionID: sessionID,
+		})
+		return
+
+	case *parser.CommitStatement, *parser.RollbackStatement:
+		// Need existing session.
+		if req.SessionID == "" {
+			writeJSON(w, QueryResponse{Error: "COMMIT/ROLLBACK requires a session_id", Tokens: traceTokens, AST: ast})
+			return
+		}
+		h.mu.Lock()
+		exec = h.sessions[req.SessionID]
+		h.mu.Unlock()
+		if exec == nil {
+			writeJSON(w, QueryResponse{Error: fmt.Sprintf("session %q not found", req.SessionID), Tokens: traceTokens, AST: ast})
+			return
+		}
+		result, err := exec.Execute(stmt)
+		// Always remove the session after COMMIT/ROLLBACK.
+		h.mu.Lock()
+		delete(h.sessions, req.SessionID)
+		h.mu.Unlock()
+		if err != nil {
+			writeJSON(w, QueryResponse{Error: err.Error(), Tokens: traceTokens, AST: ast})
+			return
+		}
+		writeJSON(w, QueryResponse{
 			Message:   result.Message,
 			Tokens:    traceTokens,
 			AST:       ast,
 			ExecTrace: result.Trace,
 		})
+		return
+
+	default:
+		if req.SessionID != "" {
+			// Run on existing session.
+			h.mu.Lock()
+			exec = h.sessions[req.SessionID]
+			h.mu.Unlock()
+			if exec == nil {
+				writeJSON(w, QueryResponse{Error: fmt.Sprintf("session %q not found", req.SessionID), Tokens: traceTokens, AST: ast})
+				return
+			}
+			sessionID = req.SessionID
+		} else {
+			// No session: auto-commit mode.
+			exec = executor.New(h.db)
+		}
 	}
+
+	// Execute the statement.
+	result, err := exec.Execute(stmt)
+	if err != nil {
+		writeJSON(w, QueryResponse{
+			Error:     err.Error(),
+			Tokens:    traceTokens,
+			AST:       ast,
+			SessionID: sessionID,
+		})
+		return
+	}
+
+	writeJSON(w, QueryResponse{
+		Columns:   result.Columns,
+		Rows:      result.Rows,
+		Message:   result.Message,
+		Tokens:    traceTokens,
+		AST:       ast,
+		ExecTrace: result.Trace,
+		SessionID: sessionID,
+	})
 }
 
 func serializeTokens(tokens []lexer.Token) []TraceToken {
@@ -231,6 +329,14 @@ func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 			"type":  "AnalyzeStatement",
 			"table": s.Table,
 		}
+	case *parser.BeginStatement:
+		return map[string]interface{}{"type": "BeginStatement"}
+	case *parser.CommitStatement:
+		return map[string]interface{}{"type": "CommitStatement"}
+	case *parser.RollbackStatement:
+		return map[string]interface{}{"type": "RollbackStatement"}
+	case *parser.VacuumStatement:
+		return map[string]interface{}{"type": "VacuumStatement", "table": s.Table}
 	}
 	return map[string]interface{}{"type": "Unknown"}
 }
@@ -297,6 +403,37 @@ func TablesHandler(db *storage.Database) http.HandlerFunc {
 			result = append(result, TblInfo{Name: t.Name, Columns: cols, RowCount: t.RowCount})
 		}
 		writeJSON(w, map[string]interface{}{"tables": result})
+	}
+}
+
+// VacuumHandler handles POST /vacuum {"table": "tablename"}.
+func VacuumHandler(db *storage.Database) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, map[string]interface{}{"error": "only POST allowed"})
+			return
+		}
+		var req struct {
+			Table string `json:"table"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Table == "" {
+			writeJSON(w, map[string]interface{}{"error": "table is required"})
+			return
+		}
+		reclaimed, err := db.Vacuum(req.Table)
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"reclaimed": reclaimed})
 	}
 }
 

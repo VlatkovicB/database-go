@@ -9,10 +9,14 @@ const (
 )
 
 // Tuple is a stored row with its physical location identifier.
+// Xmin is the transaction ID that inserted this tuple (0 = auto-committed / pre-MVCC, always visible).
+// Xmax is the transaction ID that deleted this tuple (0 = live, not yet deleted).
 type Tuple struct {
 	PageNum int
 	SlotNum int
 	Data    Row
+	Xmin    uint64 // txid that inserted this tuple
+	Xmax    uint64 // txid that deleted this tuple (0 = live)
 }
 
 // CTID returns the PostgreSQL-style tuple identifier, e.g. "(0,1)".

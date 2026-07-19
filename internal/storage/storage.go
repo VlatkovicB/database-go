@@ -47,12 +47,16 @@ type Table struct {
 }
 
 type Database struct {
-	mu     sync.RWMutex
-	Tables map[string]*Table
+	mu       sync.RWMutex
+	Tables   map[string]*Table
+	TxManager *TxManager
 }
 
 func New() *Database {
-	return &Database{Tables: make(map[string]*Table)}
+	return &Database{
+		Tables:    make(map[string]*Table),
+		TxManager: NewTxManager(),
+	}
 }
 
 func (db *Database) CreateTable(name string, cols []Column) error {
@@ -90,7 +94,9 @@ func (db *Database) GetTable(name string) (*Table, error) {
 	return t, nil
 }
 
-func (db *Database) Insert(tableName string, row Row) error {
+// Insert appends a new tuple to the table. xid is the inserting transaction ID
+// (0 means auto-committed / pre-MVCC — always visible to all transactions).
+func (db *Database) Insert(tableName string, row Row, xid uint64) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	t, ok := db.Tables[tableName]
@@ -103,14 +109,14 @@ func (db *Database) Insert(tableName string, row Row) error {
 		if len(last.Tuples) < t.tuplesPerPage {
 			slotNum := len(last.Tuples)
 			pageNum := len(t.Pages) - 1
-			inserted = Tuple{PageNum: pageNum, SlotNum: slotNum, Data: row}
+			inserted = Tuple{PageNum: pageNum, SlotNum: slotNum, Data: row, Xmin: xid}
 			last.Tuples = append(last.Tuples, inserted)
 			t.updateIndexes(inserted)
 			return nil
 		}
 	}
 	pageNum := len(t.Pages)
-	inserted = Tuple{PageNum: pageNum, SlotNum: 0, Data: row}
+	inserted = Tuple{PageNum: pageNum, SlotNum: 0, Data: row, Xmin: xid}
 	pg := Page{Tuples: []Tuple{inserted}}
 	t.Pages = append(t.Pages, pg)
 	t.updateIndexes(inserted)
@@ -118,6 +124,9 @@ func (db *Database) Insert(tableName string, row Row) error {
 }
 
 func (t *Table) updateIndexes(tuple Tuple) {
+	if tuple.Xmax != 0 {
+		return // don't index dead tuples
+	}
 	for _, idx := range t.Indexes {
 		if val, ok := tuple.Data[idx.Column]; ok {
 			idx.Tree.Insert(val, tuple)
@@ -130,16 +139,21 @@ func (t *Table) rebuildIndexes() {
 		idx.Tree = NewBTree()
 		for pageNum, pg := range t.Pages {
 			for slotNum, tpl := range pg.Tuples {
+				// Don't index dead tuples (Xmax != 0 means deleted)
+				if tpl.Xmax != 0 {
+					continue
+				}
 				if val, ok := tpl.Data[idx.Column]; ok {
-					idx.Tree.Insert(val, Tuple{PageNum: pageNum, SlotNum: slotNum, Data: tpl.Data})
+					idx.Tree.Insert(val, Tuple{PageNum: pageNum, SlotNum: slotNum, Data: tpl.Data, Xmin: tpl.Xmin, Xmax: tpl.Xmax})
 				}
 			}
 		}
 	}
 }
 
-// Scan returns a snapshot of all rows and the column schema.
-func (db *Database) Scan(tableName string) ([]Row, []Column, error) {
+// Scan returns visible rows and the column schema.
+// snap==nil means auto-commit mode: shows tuples where xmin==0 or committed AND xmax==0.
+func (db *Database) Scan(tableName string, snap *Snapshot, xid uint64) ([]Row, []Column, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	t, ok := db.Tables[tableName]
@@ -149,14 +163,39 @@ func (db *Database) Scan(tableName string) ([]Row, []Column, error) {
 	var rows []Row
 	for _, pg := range t.Pages {
 		for _, tuple := range pg.Tuples {
-			rows = append(rows, tuple.Data)
+			if db.tupleVisible(tuple, snap, xid) {
+				rows = append(rows, tuple.Data)
+			}
 		}
 	}
 	return rows, t.Columns, nil
 }
 
-// ScanPages returns all tuples with their physical locations, plus page count.
-func (db *Database) ScanPages(tableName string) ([]Tuple, []Column, int, error) {
+// TupleVisible applies MVCC visibility rules to a single tuple.
+// Exported for use by volcano nodes (e.g., index scan).
+func (db *Database) TupleVisible(tuple Tuple, snap *Snapshot, xid uint64) bool {
+	return db.tupleVisible(tuple, snap, xid)
+}
+
+// tupleVisible applies MVCC visibility rules to a single tuple.
+func (db *Database) tupleVisible(tuple Tuple, snap *Snapshot, xid uint64) bool {
+	if snap == nil {
+		// Auto-commit mode: show tuples whose inserting tx is committed (or legacy xmin=0)
+		// AND whose deletion (if any) has not yet committed.
+		xminOK := tuple.Xmin == 0 || db.TxManager.IsCommitted(tuple.Xmin)
+		if !xminOK {
+			return false
+		}
+		// Tuple is live if not deleted, or deletion not yet committed
+		xmaxDead := tuple.Xmax != 0 && db.TxManager.IsCommitted(tuple.Xmax)
+		return !xmaxDead
+	}
+	return Visible(tuple.Xmin, tuple.Xmax, *snap, xid, db.TxManager)
+}
+
+// ScanPages returns visible tuples with physical locations, plus total page count.
+// snap==nil means auto-commit mode (same visibility rules as Scan).
+func (db *Database) ScanPages(tableName string, snap *Snapshot, xid uint64) ([]Tuple, []Column, int, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	t, ok := db.Tables[tableName]
@@ -165,7 +204,11 @@ func (db *Database) ScanPages(tableName string) ([]Tuple, []Column, int, error) 
 	}
 	var tuples []Tuple
 	for _, pg := range t.Pages {
-		tuples = append(tuples, pg.Tuples...)
+		for _, tuple := range pg.Tuples {
+			if db.tupleVisible(tuple, snap, xid) {
+				tuples = append(tuples, tuple)
+			}
+		}
 	}
 	return tuples, t.Columns, len(t.Pages), nil
 }
@@ -194,9 +237,10 @@ func (db *Database) PageCount(tableName string) (int, error) {
 	return len(t.Pages), nil
 }
 
-// UpdateRows calls update on every row where predicate returns true.
-// Rows are maps (reference types), so mutations are reflected in-place.
-func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, update func(Row)) (int, error) {
+// UpdateRows implements MVCC-style update: marks matching tuples dead (Xmax=xid)
+// and inserts new tuple versions with Xmin=xid.
+// xid==0 falls back to in-place mutation for auto-commit mode.
+func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, update func(Row) Row, xid uint64) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	t, ok := db.Tables[tableName]
@@ -204,13 +248,43 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 		return 0, fmt.Errorf("table %q does not exist", tableName)
 	}
 	count := 0
+	var newRows []Row
 	for i := range t.Pages {
 		for j := range t.Pages[i].Tuples {
-			if predicate(t.Pages[i].Tuples[j].Data) {
-				update(t.Pages[i].Tuples[j].Data)
-				count++
+			tpl := &t.Pages[i].Tuples[j]
+			if tpl.Xmax != 0 {
+				continue // already dead
+			}
+			if !predicate(tpl.Data) {
+				continue
+			}
+			newRow := update(tpl.Data)
+			if xid == 0 {
+				// Auto-commit: mutate in place (legacy behaviour)
+				tpl.Data = newRow
+			} else {
+				// MVCC: stamp old tuple as deleted, queue new version
+				tpl.Xmax = xid
+				newRows = append(newRows, newRow)
+			}
+			count++
+		}
+	}
+	// Append new tuple versions for MVCC updates
+	for _, row := range newRows {
+		// find last page with room
+		if len(t.Pages) > 0 {
+			last := &t.Pages[len(t.Pages)-1]
+			if len(last.Tuples) < t.tuplesPerPage {
+				slotNum := len(last.Tuples)
+				pageNum := len(t.Pages) - 1
+				last.Tuples = append(last.Tuples, Tuple{PageNum: pageNum, SlotNum: slotNum, Data: row, Xmin: xid})
+				continue
 			}
 		}
+		pageNum := len(t.Pages)
+		pg := Page{Tuples: []Tuple{{PageNum: pageNum, SlotNum: 0, Data: row, Xmin: xid}}}
+		t.Pages = append(t.Pages, pg)
 	}
 	t.rebuildIndexes()
 	return count, nil
@@ -391,18 +465,42 @@ func (db *Database) GetTableStats(name string) *TableStats {
 	return t.Stats
 }
 
-// DeleteRows removes every row where predicate returns true.
-func (db *Database) DeleteRows(tableName string, predicate func(Row) bool) (int, error) {
+// DeleteRows implements MVCC-style delete: stamps matching live tuples with Xmax=xid.
+// When xid==0 (auto-commit), physically removes rows (legacy behaviour).
+func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid uint64) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	t, ok := db.Tables[tableName]
 	if !ok {
 		return 0, fmt.Errorf("table %q does not exist", tableName)
 	}
-	var kept []Row
 	deleted := 0
+
+	if xid != 0 {
+		// MVCC: mark matching live tuples as deleted
+		for i := range t.Pages {
+			for j := range t.Pages[i].Tuples {
+				tpl := &t.Pages[i].Tuples[j]
+				if tpl.Xmax != 0 {
+					continue // already dead
+				}
+				if predicate(tpl.Data) {
+					tpl.Xmax = xid
+					deleted++
+				}
+			}
+		}
+		t.rebuildIndexes()
+		return deleted, nil
+	}
+
+	// Auto-commit (xid==0): physical removal for backward compat
+	var kept []Row
 	for _, pg := range t.Pages {
 		for _, tuple := range pg.Tuples {
+			if tuple.Xmax != 0 {
+				continue // skip already-dead tuples
+			}
 			if predicate(tuple.Data) {
 				deleted++
 			} else {
@@ -410,7 +508,7 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool) (int,
 			}
 		}
 	}
-	// Rebuild pages from kept rows (simulates VACUUM compaction).
+	// Rebuild pages from kept rows.
 	t.Pages = nil
 	for pageNum := 0; len(kept) > 0; pageNum++ {
 		end := t.tuplesPerPage
@@ -426,4 +524,46 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool) (int,
 	}
 	t.rebuildIndexes()
 	return deleted, nil
+}
+
+// Vacuum physically removes tuples that are dead (Xmax != 0) and whose deleting
+// transaction has committed. Returns the number of tuples reclaimed.
+func (db *Database) Vacuum(tableName string) (int, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		return 0, fmt.Errorf("table %q does not exist", tableName)
+	}
+	var kept []Tuple
+	reclaimed := 0
+	for _, pg := range t.Pages {
+		for _, tuple := range pg.Tuples {
+			dead := tuple.Xmax != 0 && db.TxManager.IsCommitted(tuple.Xmax)
+			if dead {
+				reclaimed++
+			} else {
+				kept = append(kept, tuple)
+			}
+		}
+	}
+	// Rebuild pages
+	t.Pages = nil
+	for pageNum := 0; len(kept) > 0; pageNum++ {
+		end := t.tuplesPerPage
+		if end > len(kept) {
+			end = len(kept)
+		}
+		pg := Page{}
+		for i, tpl := range kept[:end] {
+			pg.Tuples = append(pg.Tuples, Tuple{
+				PageNum: pageNum, SlotNum: i,
+				Data: tpl.Data, Xmin: tpl.Xmin, Xmax: tpl.Xmax,
+			})
+		}
+		t.Pages = append(t.Pages, pg)
+		kept = kept[end:]
+	}
+	t.rebuildIndexes()
+	return reclaimed, nil
 }

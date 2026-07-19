@@ -71,6 +71,14 @@ const (
 	INDEX
 	USING
 
+	// Transaction keywords
+	BEGIN
+	COMMIT
+	ROLLBACK
+
+	// Vacuum keyword
+	VACUUM
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -132,6 +140,10 @@ var keywords = map[string]TokenType{
 	"ANALYZE":  ANALYZE,
 	"INDEX":    INDEX,
 	"USING":    USING,
+	"BEGIN":    BEGIN,
+	"COMMIT":   COMMIT,
+	"ROLLBACK": ROLLBACK,
+	"VACUUM":   VACUUM,
 }
 
 type Token struct {
@@ -154,6 +166,8 @@ var tokenNames = map[TokenType]string{
 	IF: "IF", EXISTS: "EXISTS",
 	EXPLAIN: "EXPLAIN", ANALYZE: "ANALYZE",
 	INDEX: "INDEX", USING: "USING",
+	BEGIN: "BEGIN", COMMIT: "COMMIT", ROLLBACK: "ROLLBACK",
+	VACUUM: "VACUUM",
 	ASTERISK: "*", COMMA: ",", SEMICOLON: ";", LPAREN: "(", RPAREN: ")",
 	DOT: ".", EQ: "=", NEQ: "!=", LT: "<", GT: ">", LTE: "<=", GTE: ">=",
 }
@@ -172,7 +186,9 @@ func (t TokenType) Category() string {
 		DISTINCT, ORDER, ASC, DESC, LIMIT, OFFSET,
 		IF, EXISTS,
 		EXPLAIN, ANALYZE,
-		INDEX, USING:
+		INDEX, USING,
+		BEGIN, COMMIT, ROLLBACK,
+		VACUUM:
 		return "keyword"
 	case INT, TEXT, BOOLEAN, FLOAT, PRIMARY, KEY:
 		return "type"

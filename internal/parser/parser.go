@@ -34,8 +34,19 @@ func (p *Parser) Parse() (Statement, error) {
 		return p.parseExplain()
 	case lexer.ANALYZE:
 		return p.parseAnalyze()
+	case lexer.BEGIN:
+		p.advance()
+		return &BeginStatement{}, nil
+	case lexer.COMMIT:
+		p.advance()
+		return &CommitStatement{}, nil
+	case lexer.ROLLBACK:
+		p.advance()
+		return &RollbackStatement{}, nil
+	case lexer.VACUUM:
+		return p.parseVacuum()
 	default:
-		return nil, fmt.Errorf("unexpected token %q — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, EXPLAIN, or ANALYZE", p.current().Literal)
+		return nil, fmt.Errorf("unexpected token %q — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, EXPLAIN, ANALYZE, BEGIN, COMMIT, ROLLBACK, or VACUUM", p.current().Literal)
 	}
 }
 
@@ -559,6 +570,15 @@ func (p *Parser) parseAnalyze() (*AnalyzeStatement, error) {
 	}
 	name := p.advance().Literal
 	return &AnalyzeStatement{Table: name}, nil
+}
+
+func (p *Parser) parseVacuum() (*VacuumStatement, error) {
+	p.advance() // consume VACUUM
+	if !p.is(lexer.IDENT) {
+		return nil, fmt.Errorf("VACUUM: expected table name")
+	}
+	name := p.advance().Literal
+	return &VacuumStatement{Table: name}, nil
 }
 
 func (p *Parser) parseExplain() (*ExplainStatement, error) {

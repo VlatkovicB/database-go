@@ -43,6 +43,7 @@ type Table struct {
 	Pages         []Page
 	tuplesPerPage int
 	Indexes       map[string]*Index
+	Stats         *TableStats // populated by ANALYZE
 }
 
 type Database struct {
@@ -365,6 +366,29 @@ func (db *Database) ListIndexesForTable(tableName string) []IndexInfo {
 		infos = append(infos, IndexInfo{Name: name, Column: idx.Column, Size: idx.Tree.Size})
 	}
 	return infos
+}
+
+// AnalyzeTable computes statistics for all columns in the named table (like PostgreSQL ANALYZE).
+func (db *Database) AnalyzeTable(name string) ([]string, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	t, ok := db.Tables[name]
+	if !ok {
+		return nil, fmt.Errorf("table %q does not exist", name)
+	}
+	t.Stats = computeStats(t)
+	return t.Stats.FormatAnalyzeOutput(name, t.Columns), nil
+}
+
+// GetTableStats returns the most recent ANALYZE results for a table, or nil if never analyzed.
+func (db *Database) GetTableStats(name string) *TableStats {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	t, ok := db.Tables[name]
+	if !ok {
+		return nil
+	}
+	return t.Stats
 }
 
 // DeleteRows removes every row where predicate returns true.

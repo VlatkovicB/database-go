@@ -226,6 +226,11 @@ func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 			"name":     s.Name,
 			"ifExists": s.IfExists,
 		}
+	case *parser.AnalyzeStatement:
+		return map[string]interface{}{
+			"type":  "AnalyzeStatement",
+			"table": s.Table,
+		}
 	}
 	return map[string]interface{}{"type": "Unknown"}
 }

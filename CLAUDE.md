@@ -59,6 +59,12 @@ SELECT class, COUNT(*) FROM players GROUP BY class ORDER BY COUNT(*) DESC;
 
 Column types: `INT`, `TEXT`, `BOOLEAN`, `FLOAT`.
 
+```sql
+-- Statistics (Phase 4)
+ANALYZE players;  -- computes n_distinct, null_frac, histograms per column
+                  -- output shown in execTrace; planner uses stats for next EXPLAIN
+```
+
 ## API
 
 - `POST /query` — `{"sql": "..."}` → `{columns, rows, message, tokens, ast, execTrace}`
@@ -71,9 +77,10 @@ Column types: `INT`, `TEXT`, `BOOLEAN`, `FLOAT`.
 |---|---|---|
 | Token types | `internal/lexer/token.go` | `TokenType` constants, `Name()`, `Category()` |
 | Lexer | `internal/lexer/lexer.go` | `New(sql).Tokenize()` |
-| AST nodes | `internal/parser/ast.go` | All statement + expression types |
+| AST nodes | `internal/parser/ast.go` | All statement + expression types incl. `AnalyzeStatement` |
 | Parser | `internal/parser/parser.go` | Recursive descent; helpers: `p.is()`, `parseOptionalWhere()`, `parseOptionalAlias()`, `parseAggParen()`, `parseIntKeyword()`, `isAggFunc()` |
-| Executor | `internal/executor/executor.go` | `execSelectSingle`, `execSelectJoin`, `execSelectGroupBy`; `postProcess()` runs DISTINCT → ORDER BY → LIMIT/OFFSET |
+| Executor | `internal/executor/executor.go` | `execSelectSingle`, `execSelectJoin`, `execSelectGroupBy`; `postProcess()` runs DISTINCT → ORDER BY → LIMIT/OFFSET; `estimateSelectivity()` uses column stats |
+| Column statistics | `internal/storage/stats.go` | `ColumnStats` (NDistinct, NullFrac, Histogram, MCV), `TableStats`, `computeStats()` |
 | HTTP handlers | `api/handler.go` | `stmtToTrace()` / `exprToTrace()` serialize AST to JSON |
 | Seed data | `api/seed.go` | `seedStatements []string` — 10 game tables |
 | Frontend | `cmd/server/web/index.html` | Pipeline animation, exec-order panel, Seed + Format buttons |
@@ -93,3 +100,20 @@ Expression nodes: `BinaryExpr`, `IdentExpr`, `LiteralExpr`, `AggFuncExpr`.
 ## Storage
 
 All data in-memory — lost on restart. `Row` is `map[string]interface{}`. Aggregate results use synthetic rows with keys like `"COUNT(*)"`, `"SUM(xp)"` for HAVING evaluation.
+
+## Statistics (Phase 4)
+
+`ANALYZE tablename` runs `storage.computeStats()` which scans all rows and computes per-column:
+- `NullFrac` — fraction of NULL values
+- `NDistinct` — distinct value count (negative = all distinct, like PG)
+- `AvgWidth` — average byte width
+- `Histogram []interface{}` — equi-height bucket boundaries (up to 100 buckets)
+- `MCV []MCVEntry` — top-10 most common values with frequencies
+
+The executor's `estimateSelectivity()` uses these stats to replace hardcoded fractions:
+- `col = val`: checks MCV, falls back to `1/n_distinct`
+- `col > val` / `col < val`: binary search in histogram, returns fraction above/below
+- `GROUP BY col`: uses `n_distinct` instead of `rows/5`
+- `SELECT DISTINCT col`: uses `n_distinct` instead of `rows/2`
+
+Without ANALYZE: planner falls back to PG-style defaults (0.5% for `=`, 33% for range).

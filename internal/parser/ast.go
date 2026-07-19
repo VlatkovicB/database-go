@@ -102,6 +102,11 @@ type DropIndexStatement struct {
 	IfExists bool
 }
 
+// AnalyzeStatement computes column statistics for a table (like PostgreSQL ANALYZE).
+type AnalyzeStatement struct {
+	Table string
+}
+
 func (s *SelectStatement) statementNode()      {}
 func (s *InsertStatement) statementNode()      {}
 func (s *UpdateStatement) statementNode()      {}
@@ -111,6 +116,7 @@ func (s *DropTableStatement) statementNode()   {}
 func (s *ExplainStatement) statementNode()     {}
 func (s *CreateIndexStatement) statementNode() {}
 func (s *DropIndexStatement) statementNode()   {}
+func (s *AnalyzeStatement) statementNode()     {}
 
 // Expression nodes used in WHERE / HAVING clauses.
 type Expression interface {

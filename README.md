@@ -71,6 +71,11 @@ GROUP BY class
 HAVING COUNT(*) > 2
 ORDER BY COUNT(*) DESC
 LIMIT 5;
+
+-- Statistics (like PostgreSQL ANALYZE)
+ANALYZE players;
+-- Shows n_distinct, null_frac, histogram bounds, most common values per column.
+-- After ANALYZE, EXPLAIN row estimates use real statistics instead of fixed fractions.
 ```
 
 ### Column types
@@ -120,3 +125,19 @@ SELECT execution has three paths:
 - Any aggregate or GROUP BY → `execSelectGroupBy`
 
 All three paths finish through `postProcess`: DISTINCT dedup → ORDER BY sort → LIMIT/OFFSET slice.
+
+### Statistics engine (Phase 4)
+
+`ANALYZE table` computes per-column statistics stored in `Table.Stats`:
+- **`n_distinct`** — number of distinct values (negative = all rows are distinct, PG convention)
+- **`null_frac`** — fraction of NULL values
+- **`histogram`** — equi-height bucket boundaries (up to 100 buckets, like PG's `pg_stats.histogram_bounds`)
+- **`most_common_vals`** — top-10 values by frequency
+
+The planner's `estimateSelectivity()` uses these to produce accurate row estimates in EXPLAIN:
+- `=` predicate: checks most-common-values list, falls back to `1/n_distinct`
+- range predicate (`>`, `<`, `>=`, `<=`): binary searches histogram to find fraction above/below threshold
+- `GROUP BY`: uses column's `n_distinct` for aggregate output row estimate
+- `DISTINCT`: uses `n_distinct` of projected column
+
+Without ANALYZE, the planner falls back to PostgreSQL-style defaults (0.5% selectivity for equality, 33% for range).

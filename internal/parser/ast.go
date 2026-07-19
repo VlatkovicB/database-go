@@ -82,7 +82,13 @@ type CreateTableStatement struct {
 }
 
 type DropTableStatement struct {
-	Table string
+	Table    string
+	IfExists bool
+}
+
+type ExplainStatement struct {
+	Analyze bool
+	Stmt    Statement
 }
 
 func (s *SelectStatement) statementNode()      {}
@@ -91,6 +97,7 @@ func (s *UpdateStatement) statementNode()      {}
 func (s *DeleteStatement) statementNode()      {}
 func (s *CreateTableStatement) statementNode() {}
 func (s *DropTableStatement) statementNode()   {}
+func (s *ExplainStatement) statementNode()     {}
 
 // Expression nodes used in WHERE / HAVING clauses.
 type Expression interface {

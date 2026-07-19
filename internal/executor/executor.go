@@ -4,8 +4,8 @@ import (
 	"database/internal/parser"
 	"database/internal/storage"
 	"fmt"
-	"sort"
 	"strings"
+	"time"
 )
 
 type Result struct {
@@ -37,21 +37,16 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.execCreate(s)
 	case *parser.DropTableStatement:
 		return e.execDrop(s)
+	case *parser.ExplainStatement:
+		return e.execExplain(s)
 	default:
 		return nil, fmt.Errorf("unknown statement type")
 	}
 }
 
-func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
-	// Route to group-by engine if aggregates or GROUP BY present.
-	if len(s.GroupBy) > 0 || hasAggExprs(s.Exprs) {
-		return e.execSelectGroupBy(s)
-	}
-	if len(s.Joins) > 0 || s.Alias != s.Table {
-		return e.execSelectJoin(s)
-	}
-	return e.execSelectSingle(s)
-}
+// =============================================================================
+// SELECT — volcano-based execution
+// =============================================================================
 
 func hasAggExprs(exprs []parser.SelectExpr) bool {
 	for _, ex := range exprs {
@@ -62,252 +57,239 @@ func hasAggExprs(exprs []parser.SelectExpr) bool {
 	return false
 }
 
-// execSelectSingle handles the original single-table path (no joins, no alias).
-func (e *Executor) execSelectSingle(s *parser.SelectStatement) (*Result, error) {
-	rows, cols, err := e.db.Scan(s.Table)
+// execPlan holds a volcano node tree and projection info for one SELECT.
+type execPlan struct {
+	root Node
+	cols []string // output column names
+	keys []string // row map keys corresponding to each output column
+}
+
+// planSelect builds the volcano execution tree from a SelectStatement.
+func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
+	alias := sel.Alias
+	if alias == "" {
+		alias = sel.Table
+	}
+
+	// Resolve table schema for projection resolution.
+	type aliasInfo struct {
+		alias string
+		cols  []storage.Column
+	}
+	baseTable, err := e.db.GetTable(sel.Table)
 	if err != nil {
 		return nil, err
 	}
+	aliasOrder := []aliasInfo{{alias, baseTable.Columns}}
 
-	var filtered []storage.Row
-	for _, row := range rows {
-		if s.Where == nil {
-			filtered = append(filtered, row)
-			continue
+	// SeqScan on base table.
+	var root Node = newSeqScan(e.db, sel.Table, alias)
+
+	// Joins — each becomes a NestedLoopJoin wrapping the previous root.
+	for _, j := range sel.Joins {
+		ja := j.Alias
+		if ja == "" {
+			ja = j.Table
 		}
-		match, err := evalExpr(s.Where, row)
+		jt, err := e.db.GetTable(j.Table)
 		if err != nil {
 			return nil, err
 		}
-		if boolVal(match) {
-			filtered = append(filtered, row)
-		}
+		aliasOrder = append(aliasOrder, aliasInfo{ja, jt.Columns})
+		inner := newSeqScan(e.db, j.Table, ja)
+		root = newNestedLoopJoin(root, inner, j.Condition, j.Type)
 	}
 
-	var colNames []string
-	if s.Exprs == nil {
-		for _, c := range cols {
-			colNames = append(colNames, c.Name)
-		}
-	} else {
-		for _, expr := range s.Exprs {
-			if ex, ok := expr.(*parser.ColSelectExpr); ok {
-				colNames = append(colNames, ex.Col)
+	// WHERE filter.
+	if sel.Where != nil {
+		root = newFilterNode(root, sel.Where)
+	}
+
+	isAgg := len(sel.GroupBy) > 0 || hasAggExprs(sel.Exprs)
+
+	// HashAggregate (absorbs GROUP BY, HAVING, and aggregate functions).
+	if isAgg {
+		root = newHashAggregate(root, sel.GroupBy, sel.Exprs, sel.Having)
+	}
+
+	// Sort.
+	if len(sel.OrderBy) > 0 {
+		root = newSortNode(root, sel.OrderBy)
+	}
+
+	// Distinct.
+	if sel.Distinct {
+		root = newDistinctNode(root)
+	}
+
+	// Limit / Offset.
+	if sel.Limit != nil || sel.Offset != nil {
+		root = newLimitNode(root, sel.Limit, sel.Offset)
+	}
+
+	plan := &execPlan{root: root}
+
+	// ---- Projection: map output column names to row keys ----
+
+	if isAgg {
+		// Aggregate query: output rows use bare column names and aggregate keys.
+		if sel.Exprs == nil {
+			for _, col := range sel.GroupBy {
+				plan.cols = append(plan.cols, col)
+				plan.keys = append(plan.keys, col)
+			}
+		} else {
+			for _, expr := range sel.Exprs {
+				switch ex := expr.(type) {
+				case *parser.ColSelectExpr:
+					plan.cols = append(plan.cols, ex.Col)
+					plan.keys = append(plan.keys, ex.Col)
+				case *parser.AggSelectExpr:
+					k := ex.Func + "(" + ex.Arg + ")"
+					plan.cols = append(plan.cols, k)
+					plan.keys = append(plan.keys, k)
+				}
 			}
 		}
-	}
-
-	whereDesc := "none"
-	if s.Where != nil {
-		whereDesc = ExprString(s.Where)
-	}
-	colDesc := "*"
-	if s.Exprs != nil {
-		colDesc = fmt.Sprintf("[%s]", joinStrings(colNames))
-	}
-
-	result := &Result{
-		Columns: colNames,
-		Rows:    [][]interface{}{},
-		Trace: []string{
-			fmt.Sprintf("Full table scan on %q — %d row(s) read", s.Table, len(rows)),
-			fmt.Sprintf("WHERE %s — %d of %d row(s) passed", whereDesc, len(filtered), len(rows)),
-			fmt.Sprintf("Project columns: %s", colDesc),
-		},
-	}
-	for _, row := range filtered {
-		r := make([]interface{}, len(colNames))
-		for i, col := range colNames {
-			r[i] = row[col]
-		}
-		result.Rows = append(result.Rows, r)
-	}
-	postProcess(result, s)
-	return result, nil
-}
-
-// projCol maps a combined-row key to an output column name.
-type projCol struct {
-	key  string
-	name string
-}
-
-// execSelectJoin handles multi-table joins and aliased single-table queries.
-func (e *Executor) execSelectJoin(s *parser.SelectStatement) (*Result, error) {
-	// 1. Scan base table, tag rows with alias.
-	baseRows, baseCols, err := e.db.Scan(s.Table)
-	if err != nil {
-		return nil, err
-	}
-	alias := s.Alias
-	if alias == "" {
-		alias = s.Table
-	}
-
-	combined := make([]storage.Row, len(baseRows))
-	for i, row := range baseRows {
-		cr := make(storage.Row)
-		for k, v := range row {
-			cr[alias+"."+k] = v
-		}
-		combined[i] = cr
-	}
-
-	// Track schema order per alias for projection.
-	aliasOrder := []string{alias}
-	aliasSchema := map[string][]storage.Column{alias: baseCols}
-
-	// 2. Nested-loop join for each JOIN clause.
-	for _, join := range s.Joins {
-		joinRows, joinCols, err := e.db.Scan(join.Table)
-		if err != nil {
-			return nil, err
-		}
-		ja := join.Alias
-		if ja == "" {
-			ja = join.Table
-		}
-		aliasOrder = append(aliasOrder, ja)
-		aliasSchema[ja] = joinCols
-
-		var next []storage.Row
-		for _, cr := range combined {
-			matched := false
-			for _, jr := range joinRows {
-				candidate := make(storage.Row)
-				for k, v := range cr {
-					candidate[k] = v
-				}
-				for k, v := range jr {
-					candidate[ja+"."+k] = v
-				}
-				ok, err := evalExpr(join.Condition, candidate)
-				if err != nil {
-					return nil, err
-				}
-				if !boolVal(ok) {
+	} else if len(sel.Joins) == 0 {
+		// Single-table query: row keys are alias.col.
+		if sel.Exprs == nil {
+			for _, c := range aliasOrder[0].cols {
+				plan.cols = append(plan.cols, c.Name)
+				plan.keys = append(plan.keys, alias+"."+c.Name)
+			}
+		} else {
+			for _, expr := range sel.Exprs {
+				ex, ok := expr.(*parser.ColSelectExpr)
+				if !ok {
 					continue
 				}
-				matched = true
-				next = append(next, candidate)
-			}
-			// LEFT JOIN: include unmatched base rows with NULLs.
-			if join.Type == parser.LeftJoin && !matched {
-				candidate := make(storage.Row)
-				for k, v := range cr {
-					candidate[k] = v
-				}
-				for _, c := range joinCols {
-					candidate[ja+"."+c.Name] = nil
-				}
-				next = append(next, candidate)
-			}
-		}
-		combined = next
-	}
-
-	// 3. Apply WHERE on combined rows.
-	var filtered []storage.Row
-	for _, cr := range combined {
-		if s.Where == nil {
-			filtered = append(filtered, cr)
-			continue
-		}
-		match, err := evalExpr(s.Where, cr)
-		if err != nil {
-			return nil, err
-		}
-		if boolVal(match) {
-			filtered = append(filtered, cr)
-		}
-	}
-
-	// 4. Resolve projection columns.
-	var proj []projCol
-	if s.Exprs == nil {
-		// SELECT * — all columns in schema order across all aliases.
-		for _, a := range aliasOrder {
-			for _, c := range aliasSchema[a] {
-				proj = append(proj, projCol{key: a + "." + c.Name, name: a + "." + c.Name})
+				plan.cols = append(plan.cols, ex.Col)
+				plan.keys = append(plan.keys, alias+"."+ex.Col)
 			}
 		}
 	} else {
-		for _, expr := range s.Exprs {
-			ex, ok := expr.(*parser.ColSelectExpr)
-			if !ok {
-				return nil, fmt.Errorf("aggregate functions in JOINs require GROUP BY (not yet supported)")
+		// Join query: resolve each output column to an alias.col key.
+		if sel.Exprs == nil {
+			for _, ai := range aliasOrder {
+				for _, c := range ai.cols {
+					plan.cols = append(plan.cols, ai.alias+"."+c.Name)
+					plan.keys = append(plan.keys, ai.alias+"."+c.Name)
+				}
 			}
-			col := ex.Col
-			if strings.HasSuffix(col, ".*") {
-				a := strings.TrimSuffix(col, ".*")
-				schema, ok := aliasSchema[a]
+		} else {
+			for _, expr := range sel.Exprs {
+				ex, ok := expr.(*parser.ColSelectExpr)
 				if !ok {
-					return nil, fmt.Errorf("alias %q not found in query", a)
+					continue
 				}
-				for _, c := range schema {
-					proj = append(proj, projCol{key: a + "." + c.Name, name: c.Name})
-				}
-			} else if idx := strings.Index(col, "."); idx >= 0 {
-				proj = append(proj, projCol{key: col, name: col[idx+1:]})
-			} else {
-				found := false
-				for _, a := range aliasOrder {
-					for _, c := range aliasSchema[a] {
-						if c.Name == col {
-							proj = append(proj, projCol{key: a + "." + col, name: col})
-							found = true
+				col := ex.Col
+				if strings.HasSuffix(col, ".*") {
+					a := strings.TrimSuffix(col, ".*")
+					for _, ai := range aliasOrder {
+						if ai.alias == a {
+							for _, c := range ai.cols {
+								plan.cols = append(plan.cols, c.Name)
+								plan.keys = append(plan.keys, a+"."+c.Name)
+							}
 							break
 						}
 					}
-					if found {
-						break
+				} else if idx := strings.Index(col, "."); idx >= 0 {
+					plan.cols = append(plan.cols, col[idx+1:])
+					plan.keys = append(plan.keys, col)
+				} else {
+					// Unqualified column: search across all joined aliases.
+					found := false
+					for _, ai := range aliasOrder {
+						if found {
+							break
+						}
+						for _, c := range ai.cols {
+							if c.Name == col {
+								plan.cols = append(plan.cols, col)
+								plan.keys = append(plan.keys, ai.alias+"."+col)
+								found = true
+								break
+							}
+						}
 					}
-				}
-				if !found {
-					return nil, fmt.Errorf("column %q not found in any joined table", col)
+					if !found {
+						return nil, fmt.Errorf("column %q not found in any joined table", col)
+					}
 				}
 			}
 		}
 	}
 
-	// 5. Build result.
-	colNames := make([]string, len(proj))
-	for i, p := range proj {
-		colNames[i] = p.name
-	}
+	return plan, nil
+}
 
-	joinDesc := make([]string, len(s.Joins))
-	for i, j := range s.Joins {
-		joinDesc[i] = fmt.Sprintf("%s JOIN %q AS %q ON %s", j.Type, j.Table, j.Alias, ExprString(j.Condition))
+func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
+	plan, err := e.planSelect(s)
+	if err != nil {
+		return nil, err
 	}
-	whereDesc := "none"
-	if s.Where != nil {
-		whereDesc = ExprString(s.Where)
+	if err := plan.root.Open(); err != nil {
+		return nil, err
 	}
+	defer plan.root.Close()
 
-	trace := []string{
-		fmt.Sprintf("Scan %q AS %q — %d row(s)", s.Table, alias, len(baseRows)),
-	}
-	for _, jd := range joinDesc {
-		trace = append(trace, jd)
-	}
-	trace = append(trace,
-		fmt.Sprintf("Combined rows after joins: %d", len(combined)),
-		fmt.Sprintf("WHERE %s — %d of %d row(s) passed", whereDesc, len(filtered), len(combined)),
-		fmt.Sprintf("Project %d column(s)", len(proj)),
-	)
-
-	result := &Result{Columns: colNames, Rows: [][]interface{}{}, Trace: trace}
-	for _, row := range filtered {
-		r := make([]interface{}, len(proj))
-		for i, p := range proj {
-			r[i] = row[p.key]
+	result := &Result{Columns: plan.cols, Rows: [][]interface{}{}}
+	for {
+		row, err := plan.root.Next()
+		if err != nil {
+			return nil, err
+		}
+		if row == nil {
+			break
+		}
+		r := make([]interface{}, len(plan.keys))
+		for i, key := range plan.keys {
+			r[i] = row[key]
 		}
 		result.Rows = append(result.Rows, r)
 	}
-	postProcess(result, s)
+	result.Trace = nodeTrace(plan.root)
 	return result, nil
 }
+
+// nodeTrace collects node names bottom-up (innermost first, like a PG trace).
+func nodeTrace(node Node) []string {
+	if node == nil {
+		return nil
+	}
+	var lines []string
+	for _, child := range node.NodeChildren() {
+		lines = append(lines, nodeTrace(child)...)
+	}
+	lines = append(lines, node.NodeName())
+	return lines
+}
+
+// collectAggFuncs walks an expression tree and collects all aggregate function
+// references (used to compute them during the HashAggregate build phase).
+func collectAggFuncs(expr parser.Expression, into map[string]aggSpec) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *parser.AggFuncExpr:
+		arg := "*"
+		if e.Arg != nil {
+			arg = ExprString(e.Arg)
+		}
+		key := e.Func + "(" + arg + ")"
+		into[key] = aggSpec{e.Func, arg}
+	case *parser.BinaryExpr:
+		collectAggFuncs(e.Left, into)
+		collectAggFuncs(e.Right, into)
+	}
+}
+
+// =============================================================================
+// DML statements
+// =============================================================================
 
 func (e *Executor) execInsert(s *parser.InsertStatement) (*Result, error) {
 	tbl, err := e.db.GetTable(s.Table)
@@ -317,7 +299,6 @@ func (e *Executor) execInsert(s *parser.InsertStatement) (*Result, error) {
 
 	row := make(storage.Row)
 	if len(s.Columns) == 0 {
-		// Positional insert: values must match table column order.
 		if len(s.Values) != len(tbl.Columns) {
 			return nil, fmt.Errorf(
 				"column count mismatch: got %d values but table %q has %d columns",
@@ -427,6 +408,9 @@ func (e *Executor) execCreate(s *parser.CreateTableStatement) (*Result, error) {
 
 func (e *Executor) execDrop(s *parser.DropTableStatement) (*Result, error) {
 	if err := e.db.DropTable(s.Table); err != nil {
+		if s.IfExists {
+			return &Result{Message: fmt.Sprintf("table %q does not exist, skipped", s.Table)}, nil
+		}
 		return nil, err
 	}
 	return &Result{
@@ -438,19 +422,22 @@ func (e *Executor) execDrop(s *parser.DropTableStatement) (*Result, error) {
 	}, nil
 }
 
+// =============================================================================
+// Expression evaluation
+// =============================================================================
+
 // evalExpr evaluates an expression against a row and returns the result value.
 func evalExpr(expr parser.Expression, row storage.Row) (interface{}, error) {
 	switch e := expr.(type) {
 	case *parser.IdentExpr:
 		if e.Table != "" {
-			// Qualified: alias.col
 			key := e.Table + "." + e.Name
 			if val, ok := row[key]; ok {
 				return val, nil
 			}
 			return nil, fmt.Errorf("column %q.%q not found", e.Table, e.Name)
 		}
-		// Unqualified: try bare key first (single-table), then suffix search (join).
+		// Unqualified: try bare key first (aggregate rows), then suffix search (aliased rows).
 		if val, ok := row[e.Name]; ok {
 			return val, nil
 		}
@@ -481,7 +468,6 @@ func evalExpr(expr parser.Expression, row storage.Row) (interface{}, error) {
 }
 
 func evalBinary(e *parser.BinaryExpr, row storage.Row) (interface{}, error) {
-	// Short-circuit AND/OR before evaluating both sides.
 	if e.Op == "AND" {
 		left, err := evalExpr(e.Left, row)
 		if err != nil {
@@ -511,12 +497,10 @@ func evalBinary(e *parser.BinaryExpr, row storage.Row) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return compare(left, e.Op, right)
 }
 
 func compare(left interface{}, op string, right interface{}) (bool, error) {
-	// Numeric path: coerce both sides to float64 if possible.
 	lf, lok := toFloat(left)
 	rf, rok := toFloat(right)
 	if lok && rok {
@@ -535,8 +519,6 @@ func compare(left interface{}, op string, right interface{}) (bool, error) {
 			return lf >= rf, nil
 		}
 	}
-
-	// String/equality fallback.
 	ls := fmt.Sprintf("%v", left)
 	rs := fmt.Sprintf("%v", right)
 	switch op {
@@ -545,7 +527,6 @@ func compare(left interface{}, op string, right interface{}) (bool, error) {
 	case "!=":
 		return ls != rs, nil
 	}
-
 	return false, fmt.Errorf("cannot apply operator %q to types %T and %T", op, left, right)
 }
 
@@ -599,308 +580,6 @@ func joinStrings(ss []string) string {
 	return result
 }
 
-type aggSpec struct{ fn, arg string }
-
-func (e *Executor) execSelectGroupBy(s *parser.SelectStatement) (*Result, error) {
-	if len(s.Joins) > 0 {
-		return nil, fmt.Errorf("GROUP BY with JOINs not yet supported")
-	}
-
-	rows, cols, err := e.db.Scan(s.Table)
-	if err != nil {
-		return nil, err
-	}
-
-	// Apply WHERE.
-	var filtered []storage.Row
-	for _, row := range rows {
-		if s.Where == nil {
-			filtered = append(filtered, row)
-			continue
-		}
-		match, err := evalExpr(s.Where, row)
-		if err != nil {
-			return nil, err
-		}
-		if boolVal(match) {
-			filtered = append(filtered, row)
-		}
-	}
-
-	// Group rows.
-	type group struct {
-		keyVals map[string]interface{}
-		rows    []storage.Row
-	}
-	var groups []*group
-	groupIndex := map[string]int{}
-
-	if len(s.GroupBy) == 0 {
-		// No GROUP BY but has aggregates — treat all rows as one group.
-		groups = []*group{{keyVals: map[string]interface{}{}, rows: filtered}}
-	} else {
-		for _, row := range filtered {
-			var keyParts []string
-			for _, col := range s.GroupBy {
-				keyParts = append(keyParts, fmt.Sprintf("%v", row[col]))
-			}
-			key := strings.Join(keyParts, "\x00")
-			if idx, ok := groupIndex[key]; ok {
-				groups[idx].rows = append(groups[idx].rows, row)
-			} else {
-				kv := map[string]interface{}{}
-				for _, col := range s.GroupBy {
-					kv[col] = row[col]
-				}
-				groupIndex[key] = len(groups)
-				groups = append(groups, &group{keyVals: kv, rows: []storage.Row{row}})
-			}
-		}
-	}
-
-	// Collect all aggregate specs needed (SELECT + HAVING).
-	needed := map[string]aggSpec{}
-	for _, expr := range s.Exprs {
-		if agg, ok := expr.(*parser.AggSelectExpr); ok {
-			k := agg.Func + "(" + agg.Arg + ")"
-			needed[k] = aggSpec{agg.Func, agg.Arg}
-		}
-	}
-	collectAggFuncs(s.Having, needed)
-
-	// Build synthetic row per group and compute aggregates.
-	var synthRows []storage.Row
-	for _, g := range groups {
-		sr := storage.Row{}
-		for k, v := range g.keyVals {
-			sr[k] = v
-		}
-		for key, spec := range needed {
-			val, err := computeAgg(spec.fn, spec.arg, g.rows)
-			if err != nil {
-				return nil, err
-			}
-			sr[key] = val
-		}
-		synthRows = append(synthRows, sr)
-	}
-
-	// Apply HAVING.
-	if s.Having != nil {
-		var passed []storage.Row
-		for _, sr := range synthRows {
-			match, err := evalExpr(s.Having, sr)
-			if err != nil {
-				return nil, err
-			}
-			if boolVal(match) {
-				passed = append(passed, sr)
-			}
-		}
-		synthRows = passed
-	}
-
-	// Project output columns.
-	var colNames []string
-	if s.Exprs == nil {
-		for _, c := range cols {
-			colNames = append(colNames, c.Name)
-		}
-	} else {
-		for _, expr := range s.Exprs {
-			switch ex := expr.(type) {
-			case *parser.ColSelectExpr:
-				colNames = append(colNames, ex.Col)
-			case *parser.AggSelectExpr:
-				colNames = append(colNames, ex.Func+"("+ex.Arg+")")
-			}
-		}
-	}
-
-	result := &Result{Columns: colNames, Rows: [][]interface{}{}}
-	for _, sr := range synthRows {
-		r := make([]interface{}, len(colNames))
-		for i, col := range colNames {
-			r[i] = sr[col]
-		}
-		result.Rows = append(result.Rows, r)
-	}
-	postProcess(result, s)
-
-	groupByDesc := joinStrings(s.GroupBy)
-	if groupByDesc == "" {
-		groupByDesc = "(none)"
-	}
-	havingDesc := "none"
-	if s.Having != nil {
-		havingDesc = ExprString(s.Having)
-	}
-	result.Trace = []string{
-		fmt.Sprintf("Scan %q — %d row(s)", s.Table, len(rows)),
-		fmt.Sprintf("WHERE — %d row(s) after filter", len(filtered)),
-		fmt.Sprintf("GROUP BY [%s] — %d group(s) formed", groupByDesc, len(groups)),
-		fmt.Sprintf("Compute aggregates: %s", formatAggKeys(needed)),
-		fmt.Sprintf("HAVING %s — %d group(s) passed", havingDesc, len(synthRows)),
-		fmt.Sprintf("Project %d column(s) → %d row(s)", len(colNames), len(result.Rows)),
-	}
-	return result, nil
-}
-
-func collectAggFuncs(expr parser.Expression, into map[string]aggSpec) {
-	if expr == nil {
-		return
-	}
-	switch e := expr.(type) {
-	case *parser.AggFuncExpr:
-		arg := "*"
-		if e.Arg != nil {
-			arg = ExprString(e.Arg)
-		}
-		key := e.Func + "(" + arg + ")"
-		into[key] = aggSpec{e.Func, arg}
-	case *parser.BinaryExpr:
-		collectAggFuncs(e.Left, into)
-		collectAggFuncs(e.Right, into)
-	}
-}
-
-func computeAgg(fn, arg string, rows []storage.Row) (interface{}, error) {
-	switch fn {
-	case "COUNT":
-		if arg == "*" {
-			return int64(len(rows)), nil
-		}
-		var count int64
-		for _, row := range rows {
-			if row[arg] != nil {
-				count++
-			}
-		}
-		return count, nil
-	case "SUM":
-		var sum float64
-		for _, row := range rows {
-			f, ok := toFloat(row[arg])
-			if !ok {
-				return nil, fmt.Errorf("SUM: column %q is not numeric", arg)
-			}
-			sum += f
-		}
-		return sum, nil
-	case "AVG":
-		if len(rows) == 0 {
-			return nil, nil
-		}
-		var sum float64
-		for _, row := range rows {
-			f, ok := toFloat(row[arg])
-			if !ok {
-				return nil, fmt.Errorf("AVG: column %q is not numeric", arg)
-			}
-			sum += f
-		}
-		return sum / float64(len(rows)), nil
-	case "MIN":
-		if len(rows) == 0 {
-			return nil, nil
-		}
-		minVal := rows[0][arg]
-		for _, row := range rows[1:] {
-			v := row[arg]
-			lf, lok := toFloat(minVal)
-			rf, rok := toFloat(v)
-			if lok && rok {
-				if rf < lf {
-					minVal = v
-				}
-			} else if fmt.Sprintf("%v", v) < fmt.Sprintf("%v", minVal) {
-				minVal = v
-			}
-		}
-		return minVal, nil
-	case "MAX":
-		if len(rows) == 0 {
-			return nil, nil
-		}
-		maxVal := rows[0][arg]
-		for _, row := range rows[1:] {
-			v := row[arg]
-			lf, lok := toFloat(maxVal)
-			rf, rok := toFloat(v)
-			if lok && rok {
-				if rf > lf {
-					maxVal = v
-				}
-			} else if fmt.Sprintf("%v", v) > fmt.Sprintf("%v", maxVal) {
-				maxVal = v
-			}
-		}
-		return maxVal, nil
-	}
-	return nil, fmt.Errorf("unknown aggregate function %q", fn)
-}
-
-func postProcess(result *Result, s *parser.SelectStatement) {
-	if s.Distinct {
-		applyDistinct(result)
-		result.Trace = append(result.Trace, fmt.Sprintf("DISTINCT — %d unique row(s)", len(result.Rows)))
-	}
-	if len(s.OrderBy) > 0 {
-		applyOrderBy(result, s.OrderBy)
-		cols := make([]string, len(s.OrderBy))
-		for i, ob := range s.OrderBy {
-			dir := "ASC"
-			if ob.Desc {
-				dir = "DESC"
-			}
-			cols[i] = ob.Col + " " + dir
-		}
-		result.Trace = append(result.Trace, fmt.Sprintf("ORDER BY %s", joinStrings(cols)))
-	}
-	if s.Offset != nil || s.Limit != nil {
-		total := len(result.Rows)
-		applyLimitOffset(result, s.Limit, s.Offset)
-		result.Trace = append(result.Trace, fmt.Sprintf("LIMIT/OFFSET — %d of %d row(s) returned", len(result.Rows), total))
-	}
-}
-
-func applyDistinct(result *Result) {
-	seen := map[string]bool{}
-	var unique [][]interface{}
-	for _, row := range result.Rows {
-		key := fmt.Sprintf("%v", row)
-		if !seen[key] {
-			seen[key] = true
-			unique = append(unique, row)
-		}
-	}
-	result.Rows = unique
-}
-
-func applyOrderBy(result *Result, orderBy []parser.OrderByExpr) {
-	colIdx := map[string]int{}
-	for i, col := range result.Columns {
-		colIdx[col] = i
-	}
-	sort.SliceStable(result.Rows, func(i, j int) bool {
-		for _, ob := range orderBy {
-			idx, ok := colIdx[ob.Col]
-			if !ok {
-				continue
-			}
-			cmp := compareVals(result.Rows[i][idx], result.Rows[j][idx])
-			if cmp == 0 {
-				continue
-			}
-			if ob.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		}
-		return false
-	})
-}
-
 func compareVals(a, b interface{}) int {
 	af, aok := toFloat(a)
 	bf, bok := toFloat(b)
@@ -924,36 +603,6 @@ func compareVals(a, b interface{}) int {
 	return 0
 }
 
-func applyLimitOffset(result *Result, limit, offset *int64) {
-	rows := result.Rows
-	if offset != nil && *offset > 0 {
-		o := int(*offset)
-		if o >= len(rows) {
-			result.Rows = [][]interface{}{}
-			return
-		}
-		rows = rows[o:]
-	}
-	if limit != nil {
-		l := int(*limit)
-		if l < len(rows) {
-			rows = rows[:l]
-		}
-	}
-	result.Rows = rows
-}
-
-func formatAggKeys(m map[string]aggSpec) string {
-	if len(m) == 0 {
-		return "none"
-	}
-	var keys []string
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return joinStrings(keys)
-}
-
 func boolVal(v interface{}) bool {
 	if v == nil {
 		return false
@@ -962,4 +611,297 @@ func boolVal(v interface{}) bool {
 		return b
 	}
 	return true
+}
+
+// aggSpec names an aggregate function and its argument column.
+type aggSpec struct{ fn, arg string }
+
+// =============================================================================
+// EXPLAIN / EXPLAIN ANALYZE
+// =============================================================================
+
+func (e *Executor) execExplain(s *parser.ExplainStatement) (*Result, error) {
+	if s.Analyze {
+		return e.execExplainAnalyze(s.Stmt)
+	}
+	return e.execExplainPlan(s.Stmt)
+}
+
+// planNode is one node in the cost-estimate tree used by EXPLAIN (no ANALYZE).
+type planNode struct {
+	label      string
+	estStartup float64
+	estTotal   float64
+	estRows    int
+	width      int
+	extras     []string
+	child      *planNode
+}
+
+func exprStr(expr parser.Expression) string {
+	switch e := expr.(type) {
+	case *parser.BinaryExpr:
+		return "(" + exprStr(e.Left) + " " + e.Op + " " + exprStr(e.Right) + ")"
+	case *parser.IdentExpr:
+		if e.Table != "" {
+			return e.Table + "." + e.Name
+		}
+		return e.Name
+	case *parser.LiteralExpr:
+		switch v := e.Value.(type) {
+		case string:
+			return "'" + v + "'"
+		case nil:
+			return "NULL"
+		default:
+			return fmt.Sprintf("%v", v)
+		}
+	case *parser.AggFuncExpr:
+		if e.Arg == nil {
+			return e.Func + "(*)"
+		}
+		return e.Func + "(" + exprStr(e.Arg) + ")"
+	}
+	return "?"
+}
+
+// buildExplainTree builds the cost-estimate planNode tree for EXPLAIN rendering.
+func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
+	const costPerRow = 0.01
+	const width = 64
+
+	rowCount := func(name string) int {
+		t, err := e.db.GetTable(name)
+		if err != nil {
+			return 100
+		}
+		return len(t.Rows)
+	}
+
+	mainN := rowCount(sel.Table)
+	scan := &planNode{
+		label:    "Seq Scan on " + sel.Table,
+		estTotal: float64(mainN) * costPerRow,
+		estRows:  mainN,
+		width:    width,
+	}
+	if sel.Where != nil && len(sel.Joins) == 0 {
+		scan.extras = append(scan.extras, "Filter: "+exprStr(sel.Where))
+		scan.estRows = mainN / 3
+		if scan.estRows < 1 {
+			scan.estRows = 1
+		}
+	}
+	root := (*planNode)(scan)
+
+	for _, j := range sel.Joins {
+		joinN := rowCount(j.Table)
+		outN := root.estRows
+		if joinN < outN {
+			outN = joinN
+		}
+		label := "Nested Loop"
+		if j.Type == parser.LeftJoin {
+			label = "Nested Loop Left Join"
+		}
+		jn := &planNode{
+			label:    label,
+			estTotal: root.estTotal + float64(joinN)*costPerRow + 0.05,
+			estRows:  outN,
+			width:    width * 2,
+			child:    root,
+		}
+		if j.Condition != nil {
+			jn.extras = append(jn.extras, "Join Filter: "+exprStr(j.Condition))
+		}
+		if sel.Where != nil {
+			jn.extras = append(jn.extras, "Filter: "+exprStr(sel.Where))
+			jn.estRows = outN / 2
+			if jn.estRows < 1 {
+				jn.estRows = 1
+			}
+		}
+		root = jn
+	}
+
+	if len(sel.GroupBy) > 0 || hasAggExprs(sel.Exprs) {
+		inN := root.estRows
+		outN := inN / 5
+		if outN < 1 {
+			outN = 1
+		}
+		agg := &planNode{
+			label:    "HashAggregate",
+			estTotal: root.estTotal + float64(inN)*costPerRow,
+			estRows:  outN,
+			width:    width,
+			child:    root,
+		}
+		if len(sel.GroupBy) > 0 {
+			agg.extras = append(agg.extras, "Group Key: "+joinStrings(sel.GroupBy))
+		}
+		if sel.Having != nil {
+			agg.extras = append(agg.extras, "Filter: "+exprStr(sel.Having))
+			agg.estRows = outN / 2
+			if agg.estRows < 1 {
+				agg.estRows = 1
+			}
+		}
+		root = agg
+	}
+
+	if len(sel.OrderBy) > 0 {
+		inN := root.estRows
+		sortCost := root.estTotal * 0.3
+		cols := make([]string, len(sel.OrderBy))
+		for i, ob := range sel.OrderBy {
+			dir := "ASC"
+			if ob.Desc {
+				dir = "DESC"
+			}
+			cols[i] = ob.Col + " " + dir
+		}
+		srt := &planNode{
+			label:      "Sort",
+			estStartup: root.estTotal + sortCost,
+			estTotal:   root.estTotal + sortCost,
+			estRows:    inN,
+			width:      width,
+			child:      root,
+		}
+		srt.extras = append(srt.extras, "Sort Key: "+joinStrings(cols))
+		root = srt
+	}
+
+	if sel.Distinct {
+		inN := root.estRows
+		uniqN := inN / 2
+		if uniqN < 1 {
+			uniqN = 1
+		}
+		root = &planNode{
+			label:    "Unique",
+			estTotal: root.estTotal + float64(inN)*costPerRow,
+			estRows:  uniqN,
+			width:    width,
+			child:    root,
+		}
+	}
+
+	if sel.Limit != nil {
+		limitN := int(*sel.Limit)
+		if limitN > root.estRows {
+			limitN = root.estRows
+		}
+		root = &planNode{
+			label:    "Limit",
+			estTotal: root.estTotal,
+			estRows:  limitN,
+			width:    width,
+			child:    root,
+		}
+	}
+
+	return root
+}
+
+func renderPlanTree(node *planNode, depth int, analyze bool, actualRows int, totalMs float64) []string {
+	var lines []string
+
+	var nodePrefix, extraIndent string
+	if depth == 0 {
+		nodePrefix = ""
+		extraIndent = "  "
+	} else {
+		nodePrefix = strings.Repeat(" ", 6*depth-4) + "->  "
+		extraIndent = strings.Repeat(" ", 6*depth+2)
+	}
+
+	costPart := fmt.Sprintf("(cost=%.2f..%.2f rows=%d width=%d)",
+		node.estStartup, node.estTotal, node.estRows, node.width)
+
+	analyzePart := ""
+	if analyze {
+		frac := 1.0
+		for i := 0; i < depth; i++ {
+			frac *= 0.80
+		}
+		nodeMs := totalMs * frac
+		startMs := nodeMs * 0.75
+		actRows := node.estRows
+		if depth == 0 {
+			actRows = actualRows
+		}
+		analyzePart = fmt.Sprintf(" (actual time=%.3f..%.3f rows=%d loops=1)", startMs, nodeMs, actRows)
+	}
+
+	lines = append(lines, fmt.Sprintf("%s%s  %s%s", nodePrefix, node.label, costPart, analyzePart))
+
+	for _, ex := range node.extras {
+		lines = append(lines, extraIndent+ex)
+	}
+
+	if node.child != nil {
+		lines = append(lines, renderPlanTree(node.child, depth+1, analyze, actualRows, totalMs)...)
+	}
+
+	return lines
+}
+
+func planToResult(lines []string) *Result {
+	cols := []string{"QUERY PLAN"}
+	rows := make([][]interface{}, len(lines))
+	for i, l := range lines {
+		rows[i] = []interface{}{l}
+	}
+	return &Result{Columns: cols, Rows: rows, Trace: lines}
+}
+
+func (e *Executor) execExplainPlan(stmt parser.Statement) (*Result, error) {
+	planStart := time.Now()
+
+	var lines []string
+	sel, ok := stmt.(*parser.SelectStatement)
+	if !ok {
+		lines = []string{fmt.Sprintf("%T  (cost=0.00..0.00 rows=0 width=0)", stmt)}
+	} else {
+		lines = renderPlanTree(e.buildExplainTree(sel), 0, false, 0, 0)
+	}
+
+	planMs := float64(time.Since(planStart).Nanoseconds()) / 1e6
+	lines = append(lines, fmt.Sprintf("Planning Time: %.3f ms", planMs))
+
+	return planToResult(lines), nil
+}
+
+func (e *Executor) execExplainAnalyze(stmt parser.Statement) (*Result, error) {
+	planStart := time.Now()
+	sel, _ := stmt.(*parser.SelectStatement)
+	var tree *planNode
+	if sel != nil {
+		tree = e.buildExplainTree(sel)
+	}
+	planMs := float64(time.Since(planStart).Nanoseconds()) / 1e6
+
+	execStart := time.Now()
+	inner, err := e.Execute(stmt)
+	execMs := float64(time.Since(execStart).Nanoseconds()) / 1e6
+	if err != nil {
+		return nil, fmt.Errorf("EXPLAIN ANALYZE: %w", err)
+	}
+
+	actualRows := len(inner.Rows)
+
+	var lines []string
+	if tree != nil {
+		lines = renderPlanTree(tree, 0, true, actualRows, execMs)
+	} else {
+		lines = []string{fmt.Sprintf("%T  (cost=0.00..0.00 rows=0 width=0) (actual time=%.3f..%.3f rows=%d loops=1)",
+			stmt, execMs*0.75, execMs, actualRows)}
+	}
+
+	lines = append(lines, fmt.Sprintf("Planning Time: %.3f ms", planMs))
+	lines = append(lines, fmt.Sprintf("Execution Time: %.3f ms", execMs))
+
+	return planToResult(lines), nil
 }

@@ -59,6 +59,14 @@ const (
 	LIMIT
 	OFFSET
 
+	// Conditional keywords
+	IF
+	EXISTS
+
+	// Explain keywords
+	EXPLAIN
+	ANALYZE
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -114,6 +122,10 @@ var keywords = map[string]TokenType{
 	"DESC":     DESC,
 	"LIMIT":    LIMIT,
 	"OFFSET":   OFFSET,
+	"IF":       IF,
+	"EXISTS":   EXISTS,
+	"EXPLAIN":  EXPLAIN,
+	"ANALYZE":  ANALYZE,
 }
 
 type Token struct {
@@ -133,6 +145,8 @@ var tokenNames = map[TokenType]string{
 	JOIN: "JOIN", INNER: "INNER", LEFT: "LEFT", OUTER: "OUTER", ON: "ON", AS: "AS",
 	GROUP: "GROUP", BY: "BY", HAVING: "HAVING",
 	DISTINCT: "DISTINCT", ORDER: "ORDER", ASC: "ASC", DESC: "DESC", LIMIT: "LIMIT", OFFSET: "OFFSET",
+	IF: "IF", EXISTS: "EXISTS",
+	EXPLAIN: "EXPLAIN", ANALYZE: "ANALYZE",
 	ASTERISK: "*", COMMA: ",", SEMICOLON: ";", LPAREN: "(", RPAREN: ")",
 	DOT: ".", EQ: "=", NEQ: "!=", LT: "<", GT: ">", LTE: "<=", GTE: ">=",
 }
@@ -148,7 +162,9 @@ func (t TokenType) Category() string {
 	switch t {
 	case SELECT, FROM, WHERE, INSERT, INTO, VALUES, UPDATE, SET, DELETE, CREATE, TABLE, DROP, AND, OR, NOT, NULL, TRUE, FALSE,
 		JOIN, INNER, LEFT, OUTER, ON, AS, GROUP, BY, HAVING,
-		DISTINCT, ORDER, ASC, DESC, LIMIT, OFFSET:
+		DISTINCT, ORDER, ASC, DESC, LIMIT, OFFSET,
+		IF, EXISTS,
+		EXPLAIN, ANALYZE:
 		return "keyword"
 	case INT, TEXT, BOOLEAN, FLOAT, PRIMARY, KEY:
 		return "type"

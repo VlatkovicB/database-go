@@ -30,8 +30,10 @@ func (p *Parser) Parse() (Statement, error) {
 		return p.parseCreate()
 	case lexer.DROP:
 		return p.parseDrop()
+	case lexer.EXPLAIN:
+		return p.parseExplain()
 	default:
-		return nil, fmt.Errorf("unexpected token %q — expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP", p.current().Literal)
+		return nil, fmt.Errorf("unexpected token %q — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or EXPLAIN", p.current().Literal)
 	}
 }
 
@@ -484,11 +486,33 @@ func (p *Parser) parseDrop() (*DropTableStatement, error) {
 	if _, err := p.expect(lexer.TABLE); err != nil {
 		return nil, fmt.Errorf("DROP: expected TABLE")
 	}
+	ifExists := false
+	if p.is(lexer.IF) {
+		p.advance()
+		if _, err := p.expect(lexer.EXISTS); err != nil {
+			return nil, fmt.Errorf("DROP: expected EXISTS after IF")
+		}
+		ifExists = true
+	}
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
 		return nil, fmt.Errorf("DROP: expected table name")
 	}
-	return &DropTableStatement{Table: t.Literal}, nil
+	return &DropTableStatement{Table: t.Literal, IfExists: ifExists}, nil
+}
+
+func (p *Parser) parseExplain() (*ExplainStatement, error) {
+	p.advance() // consume EXPLAIN
+	analyze := false
+	if p.is(lexer.ANALYZE) {
+		analyze = true
+		p.advance()
+	}
+	inner, err := p.Parse()
+	if err != nil {
+		return nil, fmt.Errorf("EXPLAIN: %w", err)
+	}
+	return &ExplainStatement{Analyze: analyze, Stmt: inner}, nil
 }
 
 // --- expression parsing: OR > AND > comparison > primary ---

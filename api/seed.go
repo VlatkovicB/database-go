@@ -348,17 +348,28 @@ func execSQL(exec *executor.Executor, sql string) error {
 
 func SeedHandler(db *storage.Database) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		if r.Method != http.MethodPost {
-			writeJSON(w, map[string]interface{}{"error": "only POST allowed"})
+
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			for _, sql := range seedStatements {
+				fmt.Fprintf(w, "%s;\n", sql)
+			}
 			return
 		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]interface{}{"error": "only GET or POST allowed"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
 
 		exec := executor.New(db)
 		var errs []string

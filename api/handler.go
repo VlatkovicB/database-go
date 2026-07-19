@@ -203,6 +203,16 @@ func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 			"type":  "DropTableStatement",
 			"table": s.Table,
 		}
+	case *parser.ExplainStatement:
+		mode := "EXPLAIN"
+		if s.Analyze {
+			mode = "EXPLAIN ANALYZE"
+		}
+		return map[string]interface{}{
+			"type":  "ExplainStatement",
+			"mode":  mode,
+			"inner": stmtToTrace(s.Stmt),
+		}
 	}
 	return map[string]interface{}{"type": "Unknown"}
 }

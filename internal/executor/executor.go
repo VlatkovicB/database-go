@@ -286,11 +286,6 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 		root = newSortNode(root, sel.OrderBy)
 	}
 
-	// Distinct.
-	if sel.Distinct {
-		root = newDistinctNode(root)
-	}
-
 	// Limit / Offset.
 	if sel.Limit != nil || sel.Offset != nil {
 		root = newLimitNode(root, sel.Limit, sel.Offset)
@@ -405,6 +400,10 @@ func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
 	defer plan.root.Close()
 
 	result := &Result{Columns: plan.cols, Rows: [][]interface{}{}}
+	var seen map[string]bool
+	if s.Distinct {
+		seen = make(map[string]bool)
+	}
 	for {
 		row, err := plan.root.Next()
 		if err != nil {
@@ -416,6 +415,13 @@ func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
 		r := make([]interface{}, len(plan.keys))
 		for i, key := range plan.keys {
 			r[i] = row[key]
+		}
+		if seen != nil {
+			key := fmt.Sprintf("%v", r)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 		}
 		result.Rows = append(result.Rows, r)
 	}

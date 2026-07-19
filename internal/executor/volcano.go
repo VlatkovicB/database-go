@@ -20,16 +20,23 @@ type Node interface {
 	NodeChildren() []Node
 }
 
+// BufferReporter is implemented by scan nodes that track pages read.
+type BufferReporter interface {
+	BuffersRead() int
+	ScanTable() string
+}
+
 // =============================================================================
 // seqScan — reads all rows from one table, emits alias-prefixed rows
 // =============================================================================
 
 type seqScan struct {
-	db    *storage.Database
-	table string
-	alias string
-	rows  []storage.Row
-	pos   int
+	db          *storage.Database
+	table       string
+	alias       string
+	tuples      []storage.Tuple
+	pos         int
+	buffersRead int
 }
 
 func newSeqScan(db *storage.Database, table, alias string) *seqScan {
@@ -38,35 +45,39 @@ func newSeqScan(db *storage.Database, table, alias string) *seqScan {
 
 func (n *seqScan) NodeName() string     { return "Seq Scan on " + n.table }
 func (n *seqScan) NodeChildren() []Node { return nil }
+func (n *seqScan) BuffersRead() int     { return n.buffersRead }
+func (n *seqScan) ScanTable() string    { return n.table }
 
 func (n *seqScan) Open() error {
-	rows, _, err := n.db.Scan(n.table)
+	tuples, _, pageCount, err := n.db.ScanPages(n.table)
 	if err != nil {
 		return err
 	}
 	pfx := n.alias + "."
-	n.rows = make([]storage.Row, len(rows))
-	for i, r := range rows {
-		row := make(storage.Row, len(r))
-		for k, v := range r {
+	n.tuples = make([]storage.Tuple, len(tuples))
+	for i, t := range tuples {
+		row := make(storage.Row, len(t.Data)+1)
+		for k, v := range t.Data {
 			row[pfx+k] = v
 		}
-		n.rows[i] = row
+		row[pfx+"ctid"] = t.CTID()
+		n.tuples[i] = storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row}
 	}
+	n.buffersRead = pageCount
 	n.pos = 0
 	return nil
 }
 
 func (n *seqScan) Next() (storage.Row, error) {
-	if n.pos >= len(n.rows) {
+	if n.pos >= len(n.tuples) {
 		return nil, nil
 	}
-	row := n.rows[n.pos]
+	row := n.tuples[n.pos].Data
 	n.pos++
 	return row, nil
 }
 
-func (n *seqScan) Close() { n.rows = nil }
+func (n *seqScan) Close() { n.tuples = nil }
 
 // =============================================================================
 // filterNode — passes rows where predicate evaluates to true

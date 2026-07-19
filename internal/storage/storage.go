@@ -26,9 +26,10 @@ type Column struct {
 type Row map[string]interface{}
 
 type Table struct {
-	Name    string
-	Columns []Column
-	Rows    []Row
+	Name          string
+	Columns       []Column
+	Pages         []Page
+	tuplesPerPage int
 }
 
 type Database struct {
@@ -46,7 +47,11 @@ func (db *Database) CreateTable(name string, cols []Column) error {
 	if _, exists := db.Tables[name]; exists {
 		return fmt.Errorf("table %q already exists", name)
 	}
-	db.Tables[name] = &Table{Name: name, Columns: cols}
+	db.Tables[name] = &Table{
+		Name:          name,
+		Columns:       cols,
+		tuplesPerPage: TuplesPerPage(cols),
+	}
 	return nil
 }
 
@@ -77,7 +82,18 @@ func (db *Database) Insert(tableName string, row Row) error {
 	if !ok {
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
-	t.Rows = append(t.Rows, row)
+	if len(t.Pages) > 0 {
+		last := &t.Pages[len(t.Pages)-1]
+		if len(last.Tuples) < t.tuplesPerPage {
+			slotNum := len(last.Tuples)
+			pageNum := len(t.Pages) - 1
+			last.Tuples = append(last.Tuples, Tuple{PageNum: pageNum, SlotNum: slotNum, Data: row})
+			return nil
+		}
+	}
+	pageNum := len(t.Pages)
+	pg := Page{Tuples: []Tuple{{PageNum: pageNum, SlotNum: 0, Data: row}}}
+	t.Pages = append(t.Pages, pg)
 	return nil
 }
 
@@ -89,9 +105,52 @@ func (db *Database) Scan(tableName string) ([]Row, []Column, error) {
 	if !ok {
 		return nil, nil, fmt.Errorf("table %q does not exist", tableName)
 	}
-	rows := make([]Row, len(t.Rows))
-	copy(rows, t.Rows)
+	var rows []Row
+	for _, pg := range t.Pages {
+		for _, tuple := range pg.Tuples {
+			rows = append(rows, tuple.Data)
+		}
+	}
 	return rows, t.Columns, nil
+}
+
+// ScanPages returns all tuples with their physical locations, plus page count.
+func (db *Database) ScanPages(tableName string) ([]Tuple, []Column, int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		return nil, nil, 0, fmt.Errorf("table %q does not exist", tableName)
+	}
+	var tuples []Tuple
+	for _, pg := range t.Pages {
+		tuples = append(tuples, pg.Tuples...)
+	}
+	return tuples, t.Columns, len(t.Pages), nil
+}
+
+func (db *Database) RowCount(tableName string) (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		return 0, fmt.Errorf("table %q does not exist", tableName)
+	}
+	count := 0
+	for _, pg := range t.Pages {
+		count += len(pg.Tuples)
+	}
+	return count, nil
+}
+
+func (db *Database) PageCount(tableName string) (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		return 0, fmt.Errorf("table %q does not exist", tableName)
+	}
+	return len(t.Pages), nil
 }
 
 // UpdateRows calls update on every row where predicate returns true.
@@ -104,18 +163,20 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 		return 0, fmt.Errorf("table %q does not exist", tableName)
 	}
 	count := 0
-	for _, row := range t.Rows {
-		if predicate(row) {
-			update(row)
-			count++
+	for i := range t.Pages {
+		for j := range t.Pages[i].Tuples {
+			if predicate(t.Pages[i].Tuples[j].Data) {
+				update(t.Pages[i].Tuples[j].Data)
+				count++
+			}
 		}
 	}
 	return count, nil
 }
 
 type TableInfo struct {
-	Name    string
-	Columns []Column
+	Name     string
+	Columns  []Column
 	RowCount int
 }
 
@@ -124,10 +185,14 @@ func (db *Database) ListTables() []TableInfo {
 	defer db.mu.RUnlock()
 	var tables []TableInfo
 	for _, t := range db.Tables {
+		rowCount := 0
+		for _, pg := range t.Pages {
+			rowCount += len(pg.Tuples)
+		}
 		tables = append(tables, TableInfo{
 			Name:     t.Name,
 			Columns:  t.Columns,
-			RowCount: len(t.Rows),
+			RowCount: rowCount,
 		})
 	}
 	sort.Slice(tables, func(i, j int) bool {
@@ -146,13 +211,28 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool) (int,
 	}
 	var kept []Row
 	deleted := 0
-	for _, row := range t.Rows {
-		if predicate(row) {
-			deleted++
-		} else {
-			kept = append(kept, row)
+	for _, pg := range t.Pages {
+		for _, tuple := range pg.Tuples {
+			if predicate(tuple.Data) {
+				deleted++
+			} else {
+				kept = append(kept, tuple.Data)
+			}
 		}
 	}
-	t.Rows = kept
+	// Rebuild pages from kept rows (simulates VACUUM compaction).
+	t.Pages = nil
+	for pageNum := 0; len(kept) > 0; pageNum++ {
+		end := t.tuplesPerPage
+		if end > len(kept) {
+			end = len(kept)
+		}
+		pg := Page{}
+		for i, row := range kept[:end] {
+			pg.Tuples = append(pg.Tuples, Tuple{PageNum: pageNum, SlotNum: i, Data: row})
+		}
+		t.Pages = append(t.Pages, pg)
+		kept = kept[end:]
+	}
 	return deleted, nil
 }

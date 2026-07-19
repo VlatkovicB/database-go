@@ -671,11 +671,22 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 	const width = 64
 
 	rowCount := func(name string) int {
-		t, err := e.db.GetTable(name)
+		n, err := e.db.RowCount(name)
 		if err != nil {
 			return 100
 		}
-		return len(t.Rows)
+		return n
+	}
+
+	pageCount := func(name string) int {
+		n, err := e.db.PageCount(name)
+		if err != nil {
+			return 1
+		}
+		if n < 1 {
+			return 1
+		}
+		return n
 	}
 
 	mainN := rowCount(sel.Table)
@@ -685,6 +696,7 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 		estRows:  mainN,
 		width:    width,
 	}
+	scan.extras = append(scan.extras, fmt.Sprintf("Heap Pages: %d", pageCount(sel.Table)))
 	if sel.Where != nil && len(sel.Joins) == 0 {
 		scan.extras = append(scan.extras, "Filter: "+exprStr(sel.Where))
 		scan.estRows = mainN / 3
@@ -857,6 +869,36 @@ func planToResult(lines []string) *Result {
 	return &Result{Columns: cols, Rows: rows, Trace: lines}
 }
 
+// collectBuffers walks a volcano tree and returns buffers read per table name.
+func collectBuffers(node Node) map[string]int {
+	result := map[string]int{}
+	if node == nil {
+		return result
+	}
+	if br, ok := node.(BufferReporter); ok {
+		result[br.ScanTable()] += br.BuffersRead()
+	}
+	for _, child := range node.NodeChildren() {
+		for k, v := range collectBuffers(child) {
+			result[k] += v
+		}
+	}
+	return result
+}
+
+// injectBuffers walks the planNode tree and adds buffer stats to matching Seq Scan nodes.
+func injectBuffers(node *planNode, buffers map[string]int) {
+	if node == nil {
+		return
+	}
+	for tableName, count := range buffers {
+		if strings.HasPrefix(node.label, "Seq Scan on "+tableName) {
+			node.extras = append(node.extras, fmt.Sprintf("Buffers: shared read=%d", count))
+		}
+	}
+	injectBuffers(node.child, buffers)
+}
+
 func (e *Executor) execExplainPlan(stmt parser.Statement) (*Result, error) {
 	planStart := time.Now()
 
@@ -884,24 +926,59 @@ func (e *Executor) execExplainAnalyze(stmt parser.Statement) (*Result, error) {
 	planMs := float64(time.Since(planStart).Nanoseconds()) / 1e6
 
 	execStart := time.Now()
+
+	// Build volcano plan to collect real buffer stats.
+	if sel != nil {
+		volcanoPlan, err := e.planSelect(sel)
+		if err != nil {
+			return nil, fmt.Errorf("EXPLAIN ANALYZE: %w", err)
+		}
+		if err := volcanoPlan.root.Open(); err != nil {
+			return nil, fmt.Errorf("EXPLAIN ANALYZE: %w", err)
+		}
+		// Drain all rows.
+		var actualRows int
+		for {
+			row, err := volcanoPlan.root.Next()
+			if err != nil {
+				volcanoPlan.root.Close()
+				return nil, fmt.Errorf("EXPLAIN ANALYZE: %w", err)
+			}
+			if row == nil {
+				break
+			}
+			actualRows++
+		}
+		volcanoPlan.root.Close()
+		execMs := float64(time.Since(execStart).Nanoseconds()) / 1e6
+
+		buffers := collectBuffers(volcanoPlan.root)
+		if tree != nil {
+			injectBuffers(tree, buffers)
+		}
+
+		var lines []string
+		if tree != nil {
+			lines = renderPlanTree(tree, 0, true, actualRows, execMs)
+		} else {
+			lines = []string{fmt.Sprintf("%T  (cost=0.00..0.00 rows=0 width=0) (actual time=%.3f..%.3f rows=%d loops=1)",
+				stmt, execMs*0.75, execMs, actualRows)}
+		}
+		lines = append(lines, fmt.Sprintf("Planning Time: %.3f ms", planMs))
+		lines = append(lines, fmt.Sprintf("Execution Time: %.3f ms", execMs))
+		return planToResult(lines), nil
+	}
+
+	// Non-SELECT fallback (DDL etc.)
 	inner, err := e.Execute(stmt)
 	execMs := float64(time.Since(execStart).Nanoseconds()) / 1e6
 	if err != nil {
 		return nil, fmt.Errorf("EXPLAIN ANALYZE: %w", err)
 	}
-
 	actualRows := len(inner.Rows)
-
-	var lines []string
-	if tree != nil {
-		lines = renderPlanTree(tree, 0, true, actualRows, execMs)
-	} else {
-		lines = []string{fmt.Sprintf("%T  (cost=0.00..0.00 rows=0 width=0) (actual time=%.3f..%.3f rows=%d loops=1)",
-			stmt, execMs*0.75, execMs, actualRows)}
-	}
-
+	lines := []string{fmt.Sprintf("%T  (cost=0.00..0.00 rows=0 width=0) (actual time=%.3f..%.3f rows=%d loops=1)",
+		stmt, execMs*0.75, execMs, actualRows)}
 	lines = append(lines, fmt.Sprintf("Planning Time: %.3f ms", planMs))
 	lines = append(lines, fmt.Sprintf("Execution Time: %.3f ms", execMs))
-
 	return planToResult(lines), nil
 }

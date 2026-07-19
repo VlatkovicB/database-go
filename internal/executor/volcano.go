@@ -80,6 +80,79 @@ func (n *seqScan) Next() (storage.Row, error) {
 func (n *seqScan) Close() { n.tuples = nil }
 
 // =============================================================================
+// indexScan — reads rows from a B+ tree index, emits alias-prefixed rows
+// =============================================================================
+
+type indexScan struct {
+	db          *storage.Database
+	table       string
+	alias       string
+	indexName   string
+	column      string
+	lo          interface{}
+	loOp        string
+	hi          interface{}
+	hiOp        string
+	tuples      []storage.Tuple
+	pos         int
+	buffersRead int // index depth pages + heap pages touched
+}
+
+func newIndexScan(db *storage.Database, table, alias, indexName, column string, lo interface{}, loOp string, hi interface{}, hiOp string) *indexScan {
+	return &indexScan{
+		db:        db,
+		table:     table,
+		alias:     alias,
+		indexName: indexName,
+		column:    column,
+		lo:        lo,
+		loOp:      loOp,
+		hi:        hi,
+		hiOp:      hiOp,
+	}
+}
+
+func (n *indexScan) NodeName() string {
+	return "Index Scan using " + n.indexName + " on " + n.table
+}
+func (n *indexScan) NodeChildren() []Node { return nil }
+func (n *indexScan) BuffersRead() int     { return n.buffersRead }
+func (n *indexScan) ScanTable() string    { return n.table }
+
+func (n *indexScan) Open() error {
+	tuples, depth, err := n.db.IndexRangeScan(n.table, n.indexName, n.lo, n.loOp, n.hi, n.hiOp)
+	if err != nil {
+		return err
+	}
+	pfx := n.alias + "."
+	pagesHit := make(map[int]struct{})
+	n.tuples = make([]storage.Tuple, len(tuples))
+	for i, t := range tuples {
+		row := make(storage.Row, len(t.Data)+1)
+		for k, v := range t.Data {
+			row[pfx+k] = v
+		}
+		row[pfx+"ctid"] = t.CTID()
+		n.tuples[i] = storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row}
+		pagesHit[t.PageNum] = struct{}{}
+	}
+	n.buffersRead = depth + len(pagesHit)
+	n.pos = 0
+	return nil
+}
+
+func (n *indexScan) Next() (storage.Row, error) {
+	if n.pos >= len(n.tuples) {
+		return nil, nil
+	}
+	row := n.tuples[n.pos].Data
+	n.pos++
+	return row, nil
+}
+
+func (n *indexScan) Close() { n.tuples = nil }
+
+// =============================================================================
 // filterNode — passes rows where predicate evaluates to true
 // =============================================================================
 

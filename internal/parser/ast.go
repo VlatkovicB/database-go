@@ -91,6 +91,17 @@ type ExplainStatement struct {
 	Stmt    Statement
 }
 
+type CreateIndexStatement struct {
+	Name   string // index name
+	Table  string
+	Column string
+}
+
+type DropIndexStatement struct {
+	Name     string // index name
+	IfExists bool
+}
+
 func (s *SelectStatement) statementNode()      {}
 func (s *InsertStatement) statementNode()      {}
 func (s *UpdateStatement) statementNode()      {}
@@ -98,6 +109,8 @@ func (s *DeleteStatement) statementNode()      {}
 func (s *CreateTableStatement) statementNode() {}
 func (s *DropTableStatement) statementNode()   {}
 func (s *ExplainStatement) statementNode()     {}
+func (s *CreateIndexStatement) statementNode() {}
+func (s *DropIndexStatement) statementNode()   {}
 
 // Expression nodes used in WHERE / HAVING clauses.
 type Expression interface {

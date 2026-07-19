@@ -213,6 +213,19 @@ func stmtToTrace(stmt parser.Statement) map[string]interface{} {
 			"mode":  mode,
 			"inner": stmtToTrace(s.Stmt),
 		}
+	case *parser.CreateIndexStatement:
+		return map[string]interface{}{
+			"type":   "CreateIndex",
+			"name":   s.Name,
+			"table":  s.Table,
+			"column": s.Column,
+		}
+	case *parser.DropIndexStatement:
+		return map[string]interface{}{
+			"type":     "DropIndex",
+			"name":     s.Name,
+			"ifExists": s.IfExists,
+		}
 	}
 	return map[string]interface{}{"type": "Unknown"}
 }

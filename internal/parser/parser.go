@@ -435,10 +435,13 @@ func (p *Parser) parseDelete() (*DeleteStatement, error) {
 	return &DeleteStatement{Table: t.Literal, Where: where}, nil
 }
 
-func (p *Parser) parseCreate() (*CreateTableStatement, error) {
+func (p *Parser) parseCreate() (Statement, error) {
 	p.advance() // consume CREATE
+	if p.is(lexer.INDEX) {
+		return p.parseCreateIndex()
+	}
 	if _, err := p.expect(lexer.TABLE); err != nil {
-		return nil, fmt.Errorf("CREATE: expected TABLE")
+		return nil, fmt.Errorf("CREATE: expected TABLE or INDEX")
 	}
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
@@ -465,6 +468,32 @@ func (p *Parser) parseCreate() (*CreateTableStatement, error) {
 	return stmt, nil
 }
 
+func (p *Parser) parseCreateIndex() (*CreateIndexStatement, error) {
+	p.advance() // consume INDEX
+	name, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return nil, fmt.Errorf("CREATE INDEX: expected index name")
+	}
+	if _, err := p.expect(lexer.ON); err != nil {
+		return nil, fmt.Errorf("CREATE INDEX: expected ON")
+	}
+	table, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return nil, fmt.Errorf("CREATE INDEX: expected table name")
+	}
+	if _, err := p.expect(lexer.LPAREN); err != nil {
+		return nil, fmt.Errorf("CREATE INDEX: expected (")
+	}
+	col, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return nil, fmt.Errorf("CREATE INDEX: expected column name")
+	}
+	if _, err := p.expect(lexer.RPAREN); err != nil {
+		return nil, fmt.Errorf("CREATE INDEX: expected )")
+	}
+	return &CreateIndexStatement{Name: name.Literal, Table: table.Literal, Column: col.Literal}, nil
+}
+
 func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	name, err := p.expect(lexer.IDENT)
 	if err != nil {
@@ -481,10 +510,13 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	return col, nil
 }
 
-func (p *Parser) parseDrop() (*DropTableStatement, error) {
+func (p *Parser) parseDrop() (Statement, error) {
 	p.advance() // consume DROP
+	if p.is(lexer.INDEX) {
+		return p.parseDropIndex()
+	}
 	if _, err := p.expect(lexer.TABLE); err != nil {
-		return nil, fmt.Errorf("DROP: expected TABLE")
+		return nil, fmt.Errorf("DROP: expected TABLE or INDEX")
 	}
 	ifExists := false
 	if p.is(lexer.IF) {
@@ -499,6 +531,23 @@ func (p *Parser) parseDrop() (*DropTableStatement, error) {
 		return nil, fmt.Errorf("DROP: expected table name")
 	}
 	return &DropTableStatement{Table: t.Literal, IfExists: ifExists}, nil
+}
+
+func (p *Parser) parseDropIndex() (*DropIndexStatement, error) {
+	p.advance() // consume INDEX
+	ifExists := false
+	if p.is(lexer.IF) {
+		p.advance()
+		if _, err := p.expect(lexer.EXISTS); err != nil {
+			return nil, fmt.Errorf("DROP INDEX: expected EXISTS after IF")
+		}
+		ifExists = true
+	}
+	name, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return nil, fmt.Errorf("DROP INDEX: expected index name")
+	}
+	return &DropIndexStatement{Name: name.Literal, IfExists: ifExists}, nil
 }
 
 func (p *Parser) parseExplain() (*ExplainStatement, error) {

@@ -39,6 +39,10 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.execDrop(s)
 	case *parser.ExplainStatement:
 		return e.execExplain(s)
+	case *parser.CreateIndexStatement:
+		return e.execCreateIndex(s)
+	case *parser.DropIndexStatement:
+		return e.execDropIndex(s)
 	default:
 		return nil, fmt.Errorf("unknown statement type")
 	}
@@ -55,6 +59,127 @@ func hasAggExprs(exprs []parser.SelectExpr) bool {
 		}
 	}
 	return false
+}
+
+// indexPlan captures a WHERE predicate that can be satisfied by a B+ tree index.
+type indexPlan struct {
+	indexName string
+	column    string
+	lo        interface{}
+	loOp      string
+	hi        interface{}
+	hiOp      string
+	residual  parser.Expression // remaining WHERE conditions not covered by the index
+}
+
+// extractSingleBound checks if expr is a simple "col op literal" or "literal op col" comparison.
+// Returns the column name and populated lo/hi bounds, or ok=false if not applicable.
+func extractSingleBound(expr parser.Expression) (col string, lo interface{}, loOp string, hi interface{}, hiOp string, ok bool) {
+	bin, isBin := expr.(*parser.BinaryExpr)
+	if !isBin {
+		return
+	}
+
+	var ident *parser.IdentExpr
+	var lit *parser.LiteralExpr
+	var op string
+
+	if id, o1 := bin.Left.(*parser.IdentExpr); o1 {
+		if l, o2 := bin.Right.(*parser.LiteralExpr); o2 {
+			ident, lit, op = id, l, bin.Op
+		}
+	} else if id, o1 := bin.Right.(*parser.IdentExpr); o1 {
+		if l, o2 := bin.Left.(*parser.LiteralExpr); o2 {
+			ident, lit = id, l
+			switch bin.Op {
+			case ">":
+				op = "<"
+			case ">=":
+				op = "<="
+			case "<":
+				op = ">"
+			case "<=":
+				op = ">="
+			default:
+				op = bin.Op
+			}
+		}
+	}
+	if ident == nil {
+		return
+	}
+	col = ident.Name
+	switch op {
+	case "=":
+		return col, lit.Value, "=", nil, "", true
+	case ">":
+		return col, lit.Value, ">", nil, "", true
+	case ">=":
+		return col, lit.Value, ">=", nil, "", true
+	case "<":
+		return col, nil, "", lit.Value, "<", true
+	case "<=":
+		return col, nil, "", lit.Value, "<=", true
+	}
+	return
+}
+
+// extractRangeBounds tries to extract index-compatible bounds from a WHERE expression.
+// Handles: single predicate, or two predicates on the same column joined by AND.
+func extractRangeBounds(where parser.Expression) (col string, lo interface{}, loOp string, hi interface{}, hiOp string, residual parser.Expression, ok bool) {
+	col, lo, loOp, hi, hiOp, ok = extractSingleBound(where)
+	if ok {
+		return col, lo, loOp, hi, hiOp, nil, true
+	}
+	bin, isBin := where.(*parser.BinaryExpr)
+	if !isBin || bin.Op != "AND" {
+		return
+	}
+	col2, lo2, loOp2, hi2, hiOp2, ok2 := extractSingleBound(bin.Left)
+	col3, lo3, loOp3, hi3, hiOp3, ok3 := extractSingleBound(bin.Right)
+
+	if ok2 && ok3 && col2 == col3 {
+		lo, loOp = lo2, loOp2
+		hi, hiOp = hi2, hiOp2
+		if lo == nil {
+			lo, loOp = lo3, loOp3
+		}
+		if hi == nil {
+			hi, hiOp = hi3, hiOp3
+		}
+		return col2, lo, loOp, hi, hiOp, nil, true
+	}
+	if ok2 {
+		return col2, lo2, loOp2, hi2, hiOp2, bin.Right, true
+	}
+	if ok3 {
+		return col3, lo3, loOp3, hi3, hiOp3, bin.Left, true
+	}
+	return
+}
+
+// findIndexPlan returns an *indexPlan if the WHERE clause can use an index on tableName.
+func (e *Executor) findIndexPlan(tableName string, where parser.Expression) *indexPlan {
+	if where == nil {
+		return nil
+	}
+	col, lo, loOp, hi, hiOp, residual, ok := extractRangeBounds(where)
+	if !ok {
+		return nil
+	}
+	indexName, found := e.db.FindIndexForColumn(tableName, col)
+	if !found {
+		return nil
+	}
+	return &indexPlan{
+		indexName: indexName,
+		column:    col,
+		lo:        lo,
+		loOp:      loOp,
+		hi:        hi,
+		hiOp:      hiOp,
+		residual:  residual,
+	}
 }
 
 // execPlan holds a volcano node tree and projection info for one SELECT.
@@ -82,8 +207,22 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 	}
 	aliasOrder := []aliasInfo{{alias, baseTable.Columns}}
 
-	// SeqScan on base table.
-	var root Node = newSeqScan(e.db, sel.Table, alias)
+	// Choose scan strategy: Index Scan (single-table with index) or Seq Scan.
+	var root Node
+	whereHandled := false
+
+	if len(sel.Joins) == 0 {
+		if ip := e.findIndexPlan(sel.Table, sel.Where); ip != nil {
+			root = newIndexScan(e.db, sel.Table, alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp)
+			if ip.residual != nil {
+				root = newFilterNode(root, ip.residual)
+			}
+			whereHandled = true
+		}
+	}
+	if root == nil {
+		root = newSeqScan(e.db, sel.Table, alias)
+	}
 
 	// Joins — each becomes a NestedLoopJoin wrapping the previous root.
 	for _, j := range sel.Joins {
@@ -100,8 +239,8 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 		root = newNestedLoopJoin(root, inner, j.Condition, j.Type)
 	}
 
-	// WHERE filter.
-	if sel.Where != nil {
+	// WHERE filter (skip if already handled by index scan).
+	if sel.Where != nil && !whereHandled {
 		root = newFilterNode(root, sel.Where)
 	}
 
@@ -406,6 +545,35 @@ func (e *Executor) execCreate(s *parser.CreateTableStatement) (*Result, error) {
 	}, nil
 }
 
+func (e *Executor) execCreateIndex(s *parser.CreateIndexStatement) (*Result, error) {
+	if err := e.db.CreateIndex(s.Name, s.Table, s.Column); err != nil {
+		return nil, err
+	}
+	return &Result{
+		Message: fmt.Sprintf("index %q created on %q (%s)", s.Name, s.Table, s.Column),
+		Trace: []string{
+			fmt.Sprintf("Scan all pages of %q", s.Table),
+			fmt.Sprintf("Build B+ tree on column %q", s.Column),
+			fmt.Sprintf("Register index %q in table catalog", s.Name),
+		},
+	}, nil
+}
+
+func (e *Executor) execDropIndex(s *parser.DropIndexStatement) (*Result, error) {
+	if err := e.db.DropIndexByName(s.Name, s.IfExists); err != nil {
+		return nil, err
+	}
+	if s.IfExists {
+		return &Result{Message: fmt.Sprintf("index %q dropped (or did not exist)", s.Name)}, nil
+	}
+	return &Result{
+		Message: fmt.Sprintf("index %q dropped", s.Name),
+		Trace: []string{
+			fmt.Sprintf("Remove index %q from table catalog", s.Name),
+		},
+	}, nil
+}
+
 func (e *Executor) execDrop(s *parser.DropTableStatement) (*Result, error) {
 	if err := e.db.DropTable(s.Table); err != nil {
 		if s.IfExists {
@@ -665,6 +833,43 @@ func exprStr(expr parser.Expression) string {
 	return "?"
 }
 
+// buildScanNode chooses between Index Scan and Seq Scan for the base table.
+func (e *Executor) buildScanNode(sel *parser.SelectStatement, mainN int, pageCount func(string) int, costPerRow float64, width int) *planNode {
+	if sel.Where != nil && len(sel.Joins) == 0 {
+		if ip := e.findIndexPlan(sel.Table, sel.Where); ip != nil {
+			depth := e.db.GetIndexDepth(sel.Table, ip.indexName)
+			estRows := mainN / 10
+			if estRows < 1 {
+				estRows = 1
+			}
+			n := &planNode{
+				label:    "Index Scan using " + ip.indexName + " on " + sel.Table,
+				estTotal: float64(depth)*0.25 + float64(estRows)*costPerRow,
+				estRows:  estRows,
+				width:    width,
+			}
+			n.extras = append(n.extras, fmt.Sprintf("Index Cond: (%s.%s)", sel.Table, ip.column))
+			n.extras = append(n.extras, fmt.Sprintf("Index Pages: %d", depth))
+			return n
+		}
+	}
+	n := &planNode{
+		label:    "Seq Scan on " + sel.Table,
+		estTotal: float64(mainN) * costPerRow,
+		estRows:  mainN,
+		width:    width,
+	}
+	n.extras = append(n.extras, fmt.Sprintf("Heap Pages: %d", pageCount(sel.Table)))
+	if sel.Where != nil && len(sel.Joins) == 0 {
+		n.extras = append(n.extras, "Filter: "+exprStr(sel.Where))
+		n.estRows = mainN / 3
+		if n.estRows < 1 {
+			n.estRows = 1
+		}
+	}
+	return n
+}
+
 // buildExplainTree builds the cost-estimate planNode tree for EXPLAIN rendering.
 func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 	const costPerRow = 0.01
@@ -690,20 +895,7 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 	}
 
 	mainN := rowCount(sel.Table)
-	scan := &planNode{
-		label:    "Seq Scan on " + sel.Table,
-		estTotal: float64(mainN) * costPerRow,
-		estRows:  mainN,
-		width:    width,
-	}
-	scan.extras = append(scan.extras, fmt.Sprintf("Heap Pages: %d", pageCount(sel.Table)))
-	if sel.Where != nil && len(sel.Joins) == 0 {
-		scan.extras = append(scan.extras, "Filter: "+exprStr(sel.Where))
-		scan.estRows = mainN / 3
-		if scan.estRows < 1 {
-			scan.estRows = 1
-		}
-	}
+	scan := e.buildScanNode(sel, mainN, pageCount, costPerRow, width)
 	root := (*planNode)(scan)
 
 	for _, j := range sel.Joins {
@@ -886,13 +1078,14 @@ func collectBuffers(node Node) map[string]int {
 	return result
 }
 
-// injectBuffers walks the planNode tree and adds buffer stats to matching Seq Scan nodes.
+// injectBuffers walks the planNode tree and adds buffer stats to matching scan nodes.
 func injectBuffers(node *planNode, buffers map[string]int) {
 	if node == nil {
 		return
 	}
 	for tableName, count := range buffers {
-		if strings.HasPrefix(node.label, "Seq Scan on "+tableName) {
+		if strings.HasPrefix(node.label, "Seq Scan on "+tableName) ||
+			strings.HasSuffix(node.label, " on "+tableName) {
 			node.extras = append(node.extras, fmt.Sprintf("Buffers: shared read=%d", count))
 		}
 	}

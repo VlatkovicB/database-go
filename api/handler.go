@@ -31,9 +31,10 @@ type QueryResponse struct {
 	AST           interface{}            `json:"ast,omitempty"`
 	ExecTrace     []string               `json:"execTrace,omitempty"`
 	SessionID     string                 `json:"session_id,omitempty"`
-	StepLog       []executor.StepEvent   `json:"stepLog,omitempty"`
-	NodeTree      *executor.NodeTreeDesc `json:"nodeTree,omitempty"`
-	StepTruncated bool                   `json:"stepTruncated,omitempty"`
+	StepLog          []executor.StepEvent     `json:"stepLog,omitempty"`
+	NodeTree         *executor.NodeTreeDesc   `json:"nodeTree,omitempty"`
+	StepTruncated    bool                     `json:"stepTruncated,omitempty"`
+	IndexSuggestions []executor.IndexSuggestion `json:"indexSuggestions,omitempty"`
 }
 
 // Handler holds the shared database and an in-memory session store.
@@ -209,16 +210,17 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 		go h.history.Upsert(req.SQL)
 	}
 	writeJSON(w, QueryResponse{
-		Columns:       result.Columns,
-		Rows:          result.Rows,
-		Message:       result.Message,
-		Tokens:        traceTokens,
-		AST:           ast,
-		ExecTrace:     result.Trace,
-		SessionID:     sessionID,
-		StepLog:       result.StepLog,
-		NodeTree:      result.NodeTree,
-		StepTruncated: result.StepTruncated,
+		Columns:          result.Columns,
+		Rows:             result.Rows,
+		Message:          result.Message,
+		Tokens:           traceTokens,
+		AST:              ast,
+		ExecTrace:        result.Trace,
+		SessionID:        sessionID,
+		StepLog:          result.StepLog,
+		NodeTree:         result.NodeTree,
+		StepTruncated:    result.StepTruncated,
+		IndexSuggestions: result.IndexSuggestions,
 	})
 }
 

@@ -285,6 +285,19 @@
 
   .pipeline-collapsed .stage-body { display: none; }
 
+  /* Index Advisor panel */
+  .idx-panel { margin-bottom: 24px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+  .idx-panel-header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #21262d; background: #161b22; }
+  .idx-panel-title { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; flex: 1; }
+  .idx-count { color: #ffa657; font-size: 12px; }
+  .idx-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .idx-card { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 10px 14px; opacity: 0; animation: fadeUp 0.25s ease forwards; }
+  .idx-reason { color: #8b949e; font-size: 12px; margin-bottom: 8px; line-height: 1.5; }
+  .idx-sql-wrap { display: flex; align-items: center; gap: 8px; }
+  .idx-sql { color: #ffa657; font-size: 12px; font-family: 'Courier New', monospace; flex: 1; background: #0d1117; padding: 6px 10px; border-radius: 4px; border: 1px solid #21262d; }
+  .idx-run-btn { background: transparent; color: #484f58; border: 1px solid #21262d; padding: 4px 12px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px; border-radius: 4px; transition: all 0.15s; white-space: nowrap; }
+  .idx-run-btn:hover { color: #3fb950; border-color: #238636; }
+
   /* Step-through panel */
   .step-panel { margin-bottom: 24px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
   .step-panel-header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #21262d; background: #161b22; }
@@ -357,6 +370,9 @@
         </div>
         <div class="stoggle" id="stoggle-stepthrough" onclick="toggleSection('stepthrough')">
           <span class="stoggle-ind"></span><span>Step Through</span>
+        </div>
+        <div class="stoggle" id="stoggle-index-advisor" onclick="toggleSection('index-advisor')">
+          <span class="stoggle-ind"></span><span>Index Advisor</span>
         </div>
       </div>
     </div>
@@ -462,6 +478,15 @@
         </div>
       </div>
 
+      <!-- Index Advisor panel -->
+      <div class="idx-panel" id="idxPanel" style="display:none">
+        <div class="idx-panel-header">
+          <span class="idx-panel-title">Index Advisor</span>
+          <span class="idx-count" id="idxCount"></span>
+        </div>
+        <div class="idx-body" id="idxBody"></div>
+      </div>
+
       <!-- Query result -->
       <div id="result"></div>
 
@@ -479,10 +504,10 @@ const queryHistory = [];
 let pipelineCollapsed = false;
 
 // Section visibility — persisted in localStorage
-const SECTION_KEYS = ['lexer', 'parser', 'executor', 'exec-order', 'stepthrough'];
+const SECTION_KEYS = ['lexer', 'parser', 'executor', 'exec-order', 'stepthrough', 'index-advisor'];
 const sectionVisible = (() => {
   const saved = JSON.parse(localStorage.getItem('minidb-sections') || '{}');
-  const defaults = { lexer: true, parser: true, executor: true, 'exec-order': true, stepthrough: true };
+  const defaults = { lexer: true, parser: true, executor: true, 'exec-order': true, stepthrough: true, 'index-advisor': true };
   return Object.assign(defaults, saved);
 })();
 
@@ -515,6 +540,13 @@ function applySectionVisibility() {
     stepPanel.style.display = 'none';
   } else if (stepPanel && stepPanel.dataset.hasData === '1' && sectionVisible['stepthrough']) {
     stepPanel.style.display = '';
+  }
+  // index-advisor: same pattern
+  const idxPanel = document.getElementById('idxPanel');
+  if (idxPanel && idxPanel.dataset.hasData === '1' && !sectionVisible['index-advisor']) {
+    idxPanel.style.display = 'none';
+  } else if (idxPanel && idxPanel.dataset.hasData === '1' && sectionVisible['index-advisor']) {
+    idxPanel.style.display = '';
   }
   // sync toggle indicators in sidebar
   SECTION_KEYS.forEach(k => {
@@ -595,6 +627,7 @@ async function runQuery() {
       await animateExecOrder(data.ast);
       renderResult(data);
       initStepPanel(data);
+      renderIdxPanel(data);
     }
 
     refreshTables(data);
@@ -622,6 +655,9 @@ function resetPipeline() {
   document.getElementById('stage-exec-order').style.display = 'none';
   document.getElementById('exec-order-flow').innerHTML = '';
   document.getElementById('stepPanel').style.display = 'none';
+  const idxPanel = document.getElementById('idxPanel');
+  idxPanel.style.display = 'none';
+  idxPanel.dataset.hasData = '0';
 }
 
 function delay(ms) {
@@ -1185,6 +1221,44 @@ async function seedDB() {
 function esc(str) {
   return String(str)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── Index Advisor ────────────────────────────────────────────────────────
+
+function renderIdxPanel(data) {
+  const panel = document.getElementById('idxPanel');
+  const body = document.getElementById('idxBody');
+  const count = document.getElementById('idxCount');
+  const suggestions = data.indexSuggestions || [];
+
+  if (suggestions.length === 0) {
+    panel.style.display = 'none';
+    panel.dataset.hasData = '0';
+    return;
+  }
+
+  panel.dataset.hasData = '1';
+  panel.style.display = sectionVisible['index-advisor'] ? '' : 'none';
+  count.textContent = `${suggestions.length} suggestion${suggestions.length !== 1 ? 's' : ''}`;
+
+  body.innerHTML = '';
+  suggestions.forEach((s, i) => {
+    const card = document.createElement('div');
+    card.className = 'idx-card';
+    card.style.animationDelay = `${i * 60}ms`;
+    card.innerHTML = `
+      <div class="idx-reason">${esc(s.reason)}</div>
+      <div class="idx-sql-wrap">
+        <span class="idx-sql">${esc(s.sql)}</span>
+        <button class="idx-run-btn" onclick="runIndexSQL(${esc(JSON.stringify(s.sql))})">▶ Run</button>
+      </div>`;
+    body.appendChild(card);
+  });
+}
+
+function runIndexSQL(sql) {
+  document.getElementById('query').value = sql;
+  runQuery();
 }
 
 // ─── Step-through execution ───────────────────────────────────────────────

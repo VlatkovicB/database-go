@@ -8,14 +8,20 @@ import (
 	"time"
 )
 
+type IndexSuggestion struct {
+	Reason string `json:"reason"`
+	SQL    string `json:"sql"`
+}
+
 type Result struct {
-	Columns       []string
-	Rows          [][]interface{}
-	Message       string
-	Trace         []string
-	StepLog       []StepEvent
-	NodeTree      *NodeTreeDesc
-	StepTruncated bool
+	Columns          []string
+	Rows             [][]interface{}
+	Message          string
+	Trace            []string
+	StepLog          []StepEvent
+	NodeTree         *NodeTreeDesc
+	StepTruncated    bool
+	IndexSuggestions []IndexSuggestion
 }
 
 type NodeTreeDesc struct {
@@ -418,6 +424,102 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 	return plan, nil
 }
 
+// collectIndexableCols walks an expression tree and returns all column names
+// that appear in indexable comparisons (col op literal).
+func collectIndexableCols(expr parser.Expression) []string {
+	if expr == nil {
+		return nil
+	}
+	bin, ok := expr.(*parser.BinaryExpr)
+	if !ok {
+		return nil
+	}
+	if bin.Op == "AND" || bin.Op == "OR" {
+		return append(collectIndexableCols(bin.Left), collectIndexableCols(bin.Right)...)
+	}
+	col, _, _, _, _, ok2 := extractSingleBound(expr)
+	if ok2 {
+		return []string{col}
+	}
+	return nil
+}
+
+// collectJoinInnerCols returns columns from the inner table referenced in an ON condition.
+func collectJoinInnerCols(expr parser.Expression, innerTable, innerAlias string) []string {
+	if expr == nil {
+		return nil
+	}
+	bin, ok := expr.(*parser.BinaryExpr)
+	if !ok {
+		return nil
+	}
+	if bin.Op == "AND" || bin.Op == "OR" {
+		return append(collectJoinInnerCols(bin.Left, innerTable, innerAlias),
+			collectJoinInnerCols(bin.Right, innerTable, innerAlias)...)
+	}
+	if bin.Op != "=" {
+		return nil
+	}
+	var cols []string
+	check := func(id *parser.IdentExpr) {
+		if id.Table == innerAlias || id.Table == innerTable || id.Table == "" {
+			cols = append(cols, id.Name)
+		}
+	}
+	if id, ok := bin.Left.(*parser.IdentExpr); ok {
+		check(id)
+	}
+	if id, ok := bin.Right.(*parser.IdentExpr); ok {
+		check(id)
+	}
+	return cols
+}
+
+func (e *Executor) suggestIndexes(sel *parser.SelectStatement) []IndexSuggestion {
+	var suggestions []IndexSuggestion
+	seen := map[string]bool{}
+
+	if sel.Where != nil && len(sel.Joins) == 0 {
+		if e.findIndexPlan(sel.Table, sel.Where) == nil {
+			for _, col := range collectIndexableCols(sel.Where) {
+				key := sel.Table + "." + col
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				if _, found := e.db.FindIndexForColumn(sel.Table, col); !found {
+					suggestions = append(suggestions, IndexSuggestion{
+						Reason: fmt.Sprintf("SeqScan on %s with predicate on %s — index enables Index Scan", sel.Table, col),
+						SQL:    fmt.Sprintf("CREATE INDEX idx_%s_%s ON %s(%s);", sel.Table, col, sel.Table, col),
+					})
+				}
+			}
+		}
+	}
+
+	for _, j := range sel.Joins {
+		innerAlias := j.Alias
+		if innerAlias == "" {
+			innerAlias = j.Table
+		}
+		for _, col := range collectJoinInnerCols(j.Condition, j.Table, innerAlias) {
+			key := j.Table + "." + col
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if _, found := e.db.FindIndexForColumn(j.Table, col); !found {
+				suggestions = append(suggestions, IndexSuggestion{
+					Reason: fmt.Sprintf("Nested Loop Join probes %s on %s — index speeds inner lookups", j.Table, col),
+					SQL:    fmt.Sprintf("CREATE INDEX idx_%s_%s ON %s(%s);", j.Table, col, j.Table, col),
+				})
+			}
+		}
+	}
+
+	return suggestions
+}
+
 func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
 	plan, err := e.planSelect(s)
 	if err != nil {
@@ -458,6 +560,7 @@ func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
 	result.NodeTree = buildNodeTree(plan.root)
 	result.StepLog = plan.logger.Events
 	result.StepTruncated = plan.logger.Truncated
+	result.IndexSuggestions = e.suggestIndexes(s)
 	return result, nil
 }
 

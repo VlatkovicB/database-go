@@ -901,6 +901,8 @@ function clearQuery() {
 }
 
 function pushHistory(sql) {
+  const idx = queryHistory.findIndex(h => h.sql === sql);
+  if (idx !== -1) queryHistory.splice(idx, 1);
   queryHistory.unshift({ sql, time: new Date().toLocaleTimeString() });
   if (queryHistory.length > 30) queryHistory.pop();
   renderHistory();

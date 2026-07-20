@@ -8,8 +8,6 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 )
 
 //go:embed web
@@ -18,7 +16,7 @@ var webFiles embed.FS
 func main() {
 	db := storage.New()
 
-	historyPath := filepath.Join(filepath.Dir(os.Args[0]), "minidb.history.db")
+	historyPath := "minidb.history.db"
 	history, err := api.NewHistoryStore(historyPath)
 	if err != nil {
 		log.Printf("history store unavailable: %v", err)

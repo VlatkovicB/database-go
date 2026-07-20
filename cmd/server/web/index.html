@@ -22,9 +22,25 @@
   .layout { display: flex; flex: 1; overflow: hidden; }
 
   /* Sidebar */
-  .sidebar { width: 220px; background: #0d1117; border-right: 1px solid #21262d; padding: 12px 0; overflow-y: auto; flex-shrink: 0; }
+  .sidebar { width: 220px; background: #0d1117; border-right: 1px solid #21262d; flex-shrink: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .sidebar-tables { flex: 1; overflow-y: auto; padding: 12px 0 0; }
+  .sidebar-sep { border-top: 1px solid #21262d; margin: 4px 0; flex-shrink: 0; }
+  .sidebar-panels { flex-shrink: 0; padding: 4px 0 12px; }
   .sidebar-head { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 0 14px 10px; }
   .no-tables { color: #484f58; font-size: 12px; font-style: italic; padding: 0 14px; }
+
+  .stoggle {
+    display: flex; align-items: center; gap: 8px; padding: 5px 14px;
+    cursor: pointer; color: #8b949e; font-size: 12px; user-select: none;
+    transition: background 0.1s, color 0.1s;
+  }
+  .stoggle:hover { background: #161b22; color: #c9d1d9; }
+  .stoggle-ind {
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    background: #21262d; transition: background 0.15s;
+  }
+  .stoggle.on .stoggle-ind { background: #238636; }
+  .stoggle.on { color: #c9d1d9; }
 
   .tbl-group { margin-bottom: 2px; }
   .tbl-row {
@@ -245,36 +261,48 @@
 
   .pipeline-collapsed .stage-body { display: none; }
 
-  /* Options menu */
-  .opts-btn {
-    background: transparent; color: #484f58; border: 1px solid #21262d;
-    padding: 8px 14px; cursor: pointer; font-family: 'Courier New', monospace;
-    font-size: 13px; border-radius: 6px; transition: all 0.15s; position: relative;
-  }
-  .opts-btn:hover { color: #c9d1d9; border-color: #484f58; }
-  .opts-btn.active { color: #58a6ff; border-color: #388bfd; }
+  /* Step-through panel */
+  .step-panel { margin-bottom: 24px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+  .step-panel-header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #21262d; background: #161b22; }
+  .step-panel-title { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; flex: 1; }
+  .step-counter { color: #58a6ff; font-size: 12px; }
+  .step-truncated { color: #ffa657; font-size: 11px; }
+  .step-body { display: flex; min-height: 200px; }
+  .step-tree-wrap { width: 200px; flex-shrink: 0; border-right: 1px solid #21262d; padding: 12px; overflow-y: auto; }
+  .step-tree-label { color: #484f58; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .node-box { padding: 7px 10px; border: 1px solid #21262d; border-radius: 5px; margin-bottom: 4px; background: #0d1117; transition: all 0.15s; }
+  .node-box.active { border-color: #388bfd; background: #0d2040; }
+  .node-box.has-rows { border-color: #238636; }
+  .node-box.active.has-rows { border-color: #388bfd; background: #0d2040; }
+  .node-box-type { color: #8b949e; font-size: 11px; font-weight: bold; }
+  .node-box.active .node-box-type { color: #79c0ff; }
+  .node-box-stats { color: #484f58; font-size: 10px; margin-top: 2px; }
+  .node-box.has-rows .node-box-stats { color: #3fb950; }
+  .node-connector { width: 1px; height: 8px; background: #21262d; margin: 0 0 4px 16px; }
+  .step-event-wrap { flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .step-event-label { color: #484f58; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .step-event-card { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 10px 14px; font-size: 12px; }
+  .step-event-node { color: #58a6ff; font-weight: bold; margin-bottom: 4px; }
+  .step-action-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; margin-bottom: 6px; }
+  .step-action-badge.scan  { background: #1e3a5f; color: #79c0ff; }
+  .step-action-badge.pass  { background: #0d2d1a; color: #3fb950; }
+  .step-action-badge.reject{ background: #2d1515; color: #f85149; }
+  .step-action-badge.emit  { background: #2d1f5f; color: #d2a8ff; }
+  .step-action-badge.match { background: #2d2000; color: #ffa657; }
+  .step-action-badge.skip  { background: #21262d; color: #484f58; }
+  .step-action-badge.dedup { background: #21262d; color: #484f58; }
+  .step-row-data { color: #c9d1d9; line-height: 1.7; }
+  .step-row-key { color: #8b949e; }
+  .step-row-val { color: #ffa657; }
+  .step-placeholder { color: #484f58; font-size: 12px; font-style: italic; padding: 16px 0; }
+  .step-controls { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid #21262d; }
+  .step-btn { background: transparent; color: #484f58; border: 1px solid #21262d; padding: 5px 12px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px; border-radius: 5px; transition: all 0.15s; }
+  .step-btn:hover { color: #c9d1d9; border-color: #484f58; }
+  .step-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .step-btn.play-active { color: #3fb950; border-color: #238636; }
+  .step-progress { flex: 1; height: 3px; background: #21262d; border-radius: 2px; overflow: hidden; }
+  .step-progress-fill { height: 100%; background: #388bfd; transition: width 0.1s; }
 
-  .opts-dropdown {
-    display: none; position: absolute; top: calc(100% + 6px); right: 0;
-    background: #161b22; border: 1px solid #21262d; border-radius: 8px;
-    padding: 12px 16px; z-index: 100; min-width: 200px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-  }
-  .opts-dropdown.open { display: block; }
-  .opts-title { color: #484f58; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
-  .opts-row {
-    display: flex; align-items: center; gap: 10px;
-    padding: 6px 0; cursor: pointer; color: #8b949e; font-size: 12px;
-    user-select: none;
-  }
-  .opts-row:hover { color: #c9d1d9; }
-  .opts-check {
-    width: 14px; height: 14px; border-radius: 3px;
-    border: 1px solid #484f58; background: transparent;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0; transition: all 0.15s; font-size: 10px;
-  }
-  .opts-check.checked { background: #238636; border-color: #238636; color: #fff; }
-  .opts-wrap { position: relative; }
 </style>
 </head>
 <body>
@@ -285,8 +313,29 @@
 </header>
 <div class="layout">
   <aside class="sidebar">
-    <div class="sidebar-head">Tables</div>
-    <div id="tableList"><span class="no-tables">none yet</span></div>
+    <div class="sidebar-tables">
+      <div class="sidebar-head">Tables</div>
+      <div id="tableList"><span class="no-tables">none yet</span></div>
+    </div>
+    <div class="sidebar-sep"></div>
+    <div class="sidebar-panels">
+      <div class="sidebar-head">Panels</div>
+      <div class="stoggle" id="stoggle-lexer" onclick="toggleSection('lexer')">
+        <span class="stoggle-ind"></span><span>Lexer</span>
+      </div>
+      <div class="stoggle" id="stoggle-parser" onclick="toggleSection('parser')">
+        <span class="stoggle-ind"></span><span>Parser</span>
+      </div>
+      <div class="stoggle" id="stoggle-executor" onclick="toggleSection('executor')">
+        <span class="stoggle-ind"></span><span>Executor</span>
+      </div>
+      <div class="stoggle" id="stoggle-exec-order" onclick="toggleSection('exec-order')">
+        <span class="stoggle-ind"></span><span>SQL Execution Order</span>
+      </div>
+      <div class="stoggle" id="stoggle-stepthrough" onclick="toggleSection('stepthrough')">
+        <span class="stoggle-ind"></span><span>Step Through</span>
+      </div>
+    </div>
   </aside>
   <div class="main">
     <div class="editor-wrap">
@@ -298,28 +347,6 @@
       <button class="clear-btn" onclick="clearQuery()">Clear</button>
       <button class="fmt-btn" onclick="formatQuery()">⌥ Format</button>
       <span class="shortcut">Ctrl+Enter to run</span>
-      <div class="opts-wrap">
-        <button class="opts-btn" id="optsBtn" onclick="toggleOptsMenu()">⚙ Options</button>
-        <div class="opts-dropdown" id="optsDropdown">
-          <div class="opts-title">Pipeline Sections</div>
-          <div class="opts-row" onclick="toggleSection('lexer')">
-            <div class="opts-check" id="check-lexer">✓</div>
-            <span>Lexer</span>
-          </div>
-          <div class="opts-row" onclick="toggleSection('parser')">
-            <div class="opts-check" id="check-parser">✓</div>
-            <span>Parser</span>
-          </div>
-          <div class="opts-row" onclick="toggleSection('executor')">
-            <div class="opts-check" id="check-executor">✓</div>
-            <span>Executor</span>
-          </div>
-          <div class="opts-row" onclick="toggleSection('exec-order')">
-            <div class="opts-check" id="check-exec-order">✓</div>
-            <span>SQL Execution Order</span>
-          </div>
-        </div>
-      </div>
       <div class="speed-group">
         <span class="speed-label">Speed</span>
         <input type="range" id="speedSlider" min="0" max="100" value="70" oninput="onSpeedChange(this.value)">
@@ -372,6 +399,32 @@
         </div>
       </div>
 
+      <!-- Step-through execution panel -->
+      <div class="step-panel" id="stepPanel" style="display:none">
+        <div class="step-panel-header">
+          <span class="step-panel-title">Step-Through Execution</span>
+          <span class="step-counter" id="stepCounter">0 / 0</span>
+          <span class="step-truncated" id="stepTruncated" style="display:none">· capped at 500 events</span>
+        </div>
+        <div class="step-body">
+          <div class="step-tree-wrap">
+            <div class="step-tree-label">Operator Tree</div>
+            <div id="stepTree"></div>
+          </div>
+          <div class="step-event-wrap">
+            <div class="step-event-label">Current Event</div>
+            <div id="stepEventCard"><div class="step-placeholder">Press ▶ Next to step through</div></div>
+          </div>
+        </div>
+        <div class="step-controls">
+          <button class="step-btn" id="stepResetBtn" onclick="stepReset()">⏮ Reset</button>
+          <button class="step-btn" id="stepBackBtn" onclick="stepBack()">◀ Back</button>
+          <button class="step-btn" id="stepPlayBtn" onclick="stepTogglePlay()">▶ Play</button>
+          <button class="step-btn" id="stepFwdBtn" onclick="stepForward()">▶ Next</button>
+          <div class="step-progress"><div class="step-progress-fill" id="stepProgressFill" style="width:0%"></div></div>
+        </div>
+      </div>
+
       <!-- Query result -->
       <div id="result"></div>
 
@@ -389,10 +442,10 @@ const queryHistory = [];
 let pipelineCollapsed = false;
 
 // Section visibility — persisted in localStorage
-const SECTION_KEYS = ['lexer', 'parser', 'executor', 'exec-order'];
+const SECTION_KEYS = ['lexer', 'parser', 'executor', 'exec-order', 'stepthrough'];
 const sectionVisible = (() => {
   const saved = JSON.parse(localStorage.getItem('minidb-sections') || '{}');
-  const defaults = { lexer: true, parser: true, executor: true, 'exec-order': true };
+  const defaults = { lexer: true, parser: true, executor: true, 'exec-order': true, stepthrough: true };
   return Object.assign(defaults, saved);
 })();
 
@@ -412,35 +465,22 @@ function applySectionVisibility() {
     const el = document.getElementById(id);
     if (el) el.style.display = sectionVisible[key] ? '' : 'none';
   }
-  // exec-order panel is conditionally shown by animateExecOrder; just note visibility
-  const check = k => {
-    const el = document.getElementById('check-' + k);
-    if (el) {
-      el.textContent = sectionVisible[k] ? '✓' : '';
-      el.classList.toggle('checked', !!sectionVisible[k]);
-    }
-  };
-  SECTION_KEYS.forEach(check);
-}
-
-// Initialize checkboxes on load
-applySectionVisibility();
-
-function toggleOptsMenu() {
-  const dd = document.getElementById('optsDropdown');
-  const btn = document.getElementById('optsBtn');
-  const open = dd.classList.toggle('open');
-  btn.classList.toggle('active', open);
-}
-
-// Close opts dropdown when clicking outside
-document.addEventListener('click', e => {
-  const wrap = document.querySelector('.opts-wrap');
-  if (wrap && !wrap.contains(e.target)) {
-    document.getElementById('optsDropdown').classList.remove('open');
-    document.getElementById('optsBtn').classList.remove('active');
+  // stepthrough: hide panel if toggled off (only matters if it's currently shown)
+  const stepPanel = document.getElementById('stepPanel');
+  if (stepPanel && stepPanel.dataset.hasData === '1' && !sectionVisible['stepthrough']) {
+    stepPanel.style.display = 'none';
+  } else if (stepPanel && stepPanel.dataset.hasData === '1' && sectionVisible['stepthrough']) {
+    stepPanel.style.display = '';
   }
-});
+  // sync toggle indicators in sidebar
+  SECTION_KEYS.forEach(k => {
+    const el = document.getElementById('stoggle-' + k);
+    if (el) el.classList.toggle('on', !!sectionVisible[k]);
+  });
+}
+
+// Initialize sidebar toggles on load
+applySectionVisibility();
 
 // slider 0 = instant, 100 = slowest
 // exponential curve so mid-range feels "normal"
@@ -511,6 +551,7 @@ async function runQuery() {
       await animateExecutor(data.execTrace || [], data.error);
       await animateExecOrder(data.ast);
       renderResult(data);
+      initStepPanel(data);
     }
 
     refreshTables(data);
@@ -537,6 +578,7 @@ function resetPipeline() {
   document.getElementById('executor-desc').textContent = '';
   document.getElementById('stage-exec-order').style.display = 'none';
   document.getElementById('exec-order-flow').innerHTML = '';
+  document.getElementById('stepPanel').style.display = 'none';
 }
 
 function delay(ms) {
@@ -1011,6 +1053,201 @@ async function seedDB() {
 function esc(str) {
   return String(str)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── Step-through execution ───────────────────────────────────────────────
+
+let stepLog = [];
+let stepNodeTree = null;
+let stepPos = -1;
+let stepPlaying = false;
+let stepPlayTimer = null;
+const stepNodeStats = {};
+
+function initStepPanel(data) {
+  const panel = document.getElementById('stepPanel');
+  if (!data.stepLog || data.stepLog.length === 0) {
+    panel.style.display = 'none';
+    panel.dataset.hasData = '0';
+    return;
+  }
+  stepLog = data.stepLog;
+  stepNodeTree = data.nodeTree;
+  stepPos = -1;
+  stepPlaying = false;
+  clearInterval(stepPlayTimer);
+  Object.keys(stepNodeStats).forEach(k => delete stepNodeStats[k]);
+
+  panel.dataset.hasData = '1';
+  panel.style.display = sectionVisible['stepthrough'] ? '' : 'none';
+  document.getElementById('stepCounter').textContent = `0 / ${stepLog.length}`;
+  document.getElementById('stepTruncated').style.display = data.stepTruncated ? '' : 'none';
+  document.getElementById('stepPlayBtn').textContent = '▶ Play';
+  document.getElementById('stepPlayBtn').classList.remove('play-active');
+  document.getElementById('stepProgressFill').style.width = '0%';
+  document.getElementById('stepEventCard').innerHTML = '<div class="step-placeholder">Press ▶ Next to step through</div>';
+
+  renderStepTree();
+  updateStepButtons();
+}
+
+function renderStepTree() {
+  const container = document.getElementById('stepTree');
+  container.innerHTML = '';
+  if (!stepNodeTree) return;
+  renderTreeNode(container, stepNodeTree, true);
+}
+
+function renderTreeNode(parent, node, isRoot) {
+  if (!isRoot) {
+    const conn = document.createElement('div');
+    conn.className = 'node-connector';
+    parent.appendChild(conn);
+  }
+  const box = document.createElement('div');
+  box.className = 'node-box';
+  box.id = `snode-${node.id}`;
+  box.innerHTML = `<div class="node-box-type">${esc(node.nodeType)}</div><div class="node-box-stats" id="snode-stats-${node.id}">0 rows</div>`;
+  parent.appendChild(box);
+
+  if (node.children && node.children.length > 0) {
+    if (node.children.length > 1) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;';
+      parent.appendChild(row);
+      node.children.forEach(child => {
+        const col = document.createElement('div');
+        col.style.cssText = 'flex:1;min-width:0;';
+        renderTreeNode(col, child, false);
+        row.appendChild(col);
+      });
+    } else {
+      renderTreeNode(parent, node.children[0], false);
+    }
+  }
+}
+
+function stepForward() {
+  if (stepPos >= stepLog.length - 1) return;
+  stepPos++;
+  const evt = stepLog[stepPos];
+  accumulateEvent(evt);
+  showEventCard(evt);
+  highlightActiveNode(evt.nodeId);
+  updateStepUI();
+}
+
+function stepBack() {
+  if (stepPos < 0) return;
+  stepPos--;
+  Object.keys(stepNodeStats).forEach(k => delete stepNodeStats[k]);
+  document.querySelectorAll('.node-box').forEach(b => {
+    b.classList.remove('has-rows');
+    const s = b.querySelector('.node-box-stats');
+    if (s) s.textContent = '0 rows';
+  });
+  for (let i = 0; i <= stepPos; i++) accumulateEvent(stepLog[i]);
+  if (stepPos >= 0) {
+    showEventCard(stepLog[stepPos]);
+    highlightActiveNode(stepLog[stepPos].nodeId);
+  } else {
+    document.getElementById('stepEventCard').innerHTML = '<div class="step-placeholder">Press ▶ Next to step through</div>';
+    highlightActiveNode(-1);
+  }
+  updateStepUI();
+}
+
+function accumulateEvent(evt) {
+  if (!stepNodeStats[evt.nodeId]) stepNodeStats[evt.nodeId] = { out: 0, rejected: 0 };
+  const s = stepNodeStats[evt.nodeId];
+  if (evt.action === 'reject' || evt.action === 'dedup' || evt.action === 'skip') {
+    s.rejected++;
+  } else {
+    s.out++;
+  }
+  const el = document.getElementById(`snode-stats-${evt.nodeId}`);
+  if (el) {
+    el.textContent = s.rejected > 0 ? `${s.out} out, ${s.rejected} filtered` : `${s.out} rows`;
+    const box = document.getElementById(`snode-${evt.nodeId}`);
+    if (box && s.out > 0) box.classList.add('has-rows');
+  }
+}
+
+function highlightActiveNode(nodeId) {
+  document.querySelectorAll('.node-box').forEach(b => b.classList.remove('active'));
+  if (nodeId >= 0) {
+    const box = document.getElementById(`snode-${nodeId}`);
+    if (box) box.classList.add('active');
+  }
+}
+
+function showEventCard(evt) {
+  let rowHtml = '';
+  if (evt.row && Object.keys(evt.row).length > 0) {
+    rowHtml = '<div class="step-row-data">' +
+      Object.entries(evt.row).map(([k, v]) =>
+        `<span class="step-row-key">${esc(k)}</span>: <span class="step-row-val">${esc(String(v))}</span>`
+      ).join('&nbsp; &nbsp;') + '</div>';
+  }
+  document.getElementById('stepEventCard').innerHTML =
+    `<div class="step-event-card">
+      <div class="step-event-node">${esc(evt.nodeType)}</div>
+      <span class="step-action-badge ${esc(evt.action)}">${esc(evt.action)}</span>
+      ${rowHtml}
+    </div>`;
+}
+
+function updateStepUI() {
+  const total = stepLog.length;
+  const cur = stepPos + 1;
+  document.getElementById('stepCounter').textContent = `${cur} / ${total}`;
+  document.getElementById('stepProgressFill').style.width = `${total > 0 ? cur / total * 100 : 0}%`;
+  updateStepButtons();
+}
+
+function updateStepButtons() {
+  document.getElementById('stepBackBtn').disabled = stepPos < 0;
+  document.getElementById('stepFwdBtn').disabled = stepPos >= stepLog.length - 1;
+  document.getElementById('stepResetBtn').disabled = stepPos < 0;
+}
+
+function stepReset() {
+  stopStepPlay();
+  stepPos = -1;
+  Object.keys(stepNodeStats).forEach(k => delete stepNodeStats[k]);
+  document.querySelectorAll('.node-box').forEach(b => {
+    b.classList.remove('active', 'has-rows');
+    const s = b.querySelector('.node-box-stats');
+    if (s) s.textContent = '0 rows';
+  });
+  document.getElementById('stepEventCard').innerHTML = '<div class="step-placeholder">Press ▶ Next to step through</div>';
+  document.getElementById('stepCounter').textContent = `0 / ${stepLog.length}`;
+  document.getElementById('stepProgressFill').style.width = '0%';
+  updateStepButtons();
+}
+
+function stepTogglePlay() {
+  if (stepPlaying) { stopStepPlay(); } else { startStepPlay(); }
+}
+
+function startStepPlay() {
+  if (stepPos >= stepLog.length - 1) stepReset();
+  stepPlaying = true;
+  document.getElementById('stepPlayBtn').textContent = '⏸ Pause';
+  document.getElementById('stepPlayBtn').classList.add('play-active');
+  const ms = Math.max(20, 400 - speed.execStep * 2);
+  stepPlayTimer = setInterval(() => {
+    if (stepPos >= stepLog.length - 1) { stopStepPlay(); return; }
+    stepForward();
+  }, ms);
+}
+
+function stopStepPlay() {
+  stepPlaying = false;
+  clearInterval(stepPlayTimer);
+  stepPlayTimer = null;
+  document.getElementById('stepPlayBtn').textContent = '▶ Play';
+  document.getElementById('stepPlayBtn').classList.remove('play-active');
 }
 </script>
 </body>

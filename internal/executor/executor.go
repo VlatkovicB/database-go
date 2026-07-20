@@ -9,10 +9,30 @@ import (
 )
 
 type Result struct {
-	Columns []string
-	Rows    [][]interface{}
-	Message string
-	Trace   []string
+	Columns       []string
+	Rows          [][]interface{}
+	Message       string
+	Trace         []string
+	StepLog       []StepEvent
+	NodeTree      *NodeTreeDesc
+	StepTruncated bool
+}
+
+type NodeTreeDesc struct {
+	ID       int             `json:"id"`
+	NodeType string          `json:"nodeType"`
+	Children []*NodeTreeDesc `json:"children,omitempty"`
+}
+
+func buildNodeTree(node Node) *NodeTreeDesc {
+	if node == nil {
+		return nil
+	}
+	desc := &NodeTreeDesc{ID: node.NodeID(), NodeType: node.NodeName()}
+	for _, child := range node.NodeChildren() {
+		desc.Children = append(desc.Children, buildNodeTree(child))
+	}
+	return desc
 }
 
 type Executor struct {
@@ -212,9 +232,10 @@ func (e *Executor) findIndexPlan(tableName string, where parser.Expression) *ind
 
 // execPlan holds a volcano node tree and projection info for one SELECT.
 type execPlan struct {
-	root Node
-	cols []string // output column names
-	keys []string // row map keys corresponding to each output column
+	root   Node
+	cols   []string // output column names
+	keys   []string // row map keys corresponding to each output column
+	logger *ExecLogger
 }
 
 // planSelect builds the volcano execution tree from a SelectStatement.
@@ -241,17 +262,25 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 	snap := e.currentSnapshot()
 	xid := e.currentXID()
 
+	logger := newExecLogger()
+	assignLog := func(node Node) Node {
+		if l, ok := node.(loggable); ok {
+			l.setLog(logger, logger.NextID())
+		}
+		return node
+	}
+
 	if len(sel.Joins) == 0 {
 		if ip := e.findIndexPlan(sel.Table, sel.Where); ip != nil {
-			root = newIndexScan(e.db, sel.Table, alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp, snap, xid)
+			root = assignLog(newIndexScan(e.db, sel.Table, alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp, snap, xid))
 			if ip.residual != nil {
-				root = newFilterNode(root, ip.residual)
+				root = assignLog(newFilterNode(root, ip.residual))
 			}
 			whereHandled = true
 		}
 	}
 	if root == nil {
-		root = newSeqScan(e.db, sel.Table, alias, snap, xid)
+		root = assignLog(newSeqScan(e.db, sel.Table, alias, snap, xid))
 	}
 
 	// Joins — each becomes a NestedLoopJoin wrapping the previous root.
@@ -265,33 +294,33 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 			return nil, err
 		}
 		aliasOrder = append(aliasOrder, aliasInfo{ja, jt.Columns})
-		inner := newSeqScan(e.db, j.Table, ja, snap, xid)
-		root = newNestedLoopJoin(root, inner, j.Condition, j.Type)
+		inner := assignLog(newSeqScan(e.db, j.Table, ja, snap, xid))
+		root = assignLog(newNestedLoopJoin(root, inner, j.Condition, j.Type))
 	}
 
 	// WHERE filter (skip if already handled by index scan).
 	if sel.Where != nil && !whereHandled {
-		root = newFilterNode(root, sel.Where)
+		root = assignLog(newFilterNode(root, sel.Where))
 	}
 
 	isAgg := len(sel.GroupBy) > 0 || hasAggExprs(sel.Exprs)
 
 	// HashAggregate (absorbs GROUP BY, HAVING, and aggregate functions).
 	if isAgg {
-		root = newHashAggregate(root, sel.GroupBy, sel.Exprs, sel.Having)
+		root = assignLog(newHashAggregate(root, sel.GroupBy, sel.Exprs, sel.Having))
 	}
 
 	// Sort.
 	if len(sel.OrderBy) > 0 {
-		root = newSortNode(root, sel.OrderBy)
+		root = assignLog(newSortNode(root, sel.OrderBy))
 	}
 
 	// Limit / Offset.
 	if sel.Limit != nil || sel.Offset != nil {
-		root = newLimitNode(root, sel.Limit, sel.Offset)
+		root = assignLog(newLimitNode(root, sel.Limit, sel.Offset))
 	}
 
-	plan := &execPlan{root: root}
+	plan := &execPlan{root: root, logger: logger}
 
 	// ---- Projection: map output column names to row keys ----
 
@@ -426,6 +455,9 @@ func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
 		result.Rows = append(result.Rows, r)
 	}
 	result.Trace = nodeTrace(plan.root)
+	result.NodeTree = buildNodeTree(plan.root)
+	result.StepLog = plan.logger.Events
+	result.StepTruncated = plan.logger.Truncated
 	return result, nil
 }
 

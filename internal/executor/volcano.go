@@ -18,6 +18,7 @@ type Node interface {
 	Close()
 	NodeName() string
 	NodeChildren() []Node
+	NodeID() int
 }
 
 // BufferReporter is implemented by scan nodes that track pages read.
@@ -26,11 +27,72 @@ type BufferReporter interface {
 	ScanTable() string
 }
 
+const maxStepEvents = 500
+
+type StepEvent struct {
+	NodeID   int                    `json:"nodeId"`
+	NodeType string                 `json:"nodeType"`
+	Action   string                 `json:"action"`
+	Row      map[string]interface{} `json:"row,omitempty"`
+}
+
+type ExecLogger struct {
+	Events    []StepEvent
+	Truncated bool
+	nextID    int
+}
+
+func newExecLogger() *ExecLogger { return &ExecLogger{} }
+
+func (l *ExecLogger) NextID() int {
+	id := l.nextID
+	l.nextID++
+	return id
+}
+
+func (l *ExecLogger) Log(nodeID int, nodeType, action string, row storage.Row) {
+	if len(l.Events) >= maxStepEvents {
+		l.Truncated = true
+		return
+	}
+	var r map[string]interface{}
+	if row != nil {
+		r = make(map[string]interface{}, len(row))
+		for k, v := range row {
+			if idx := strings.Index(k, "."); idx >= 0 {
+				k = k[idx+1:]
+			}
+			if k == "ctid" {
+				continue
+			}
+			r[k] = v
+		}
+	}
+	l.Events = append(l.Events, StepEvent{NodeID: nodeID, NodeType: nodeType, Action: action, Row: r})
+}
+
+type nodeBase struct {
+	id  int
+	log *ExecLogger
+}
+
+func (b *nodeBase) NodeID() int { return b.id }
+
+func (b *nodeBase) setLog(log *ExecLogger, id int) {
+	b.log = log
+	b.id = id
+}
+
+type loggable interface {
+	setLog(log *ExecLogger, id int)
+}
+
 // =============================================================================
 // seqScan — reads all rows from one table, emits alias-prefixed rows
 // =============================================================================
 
 type seqScan struct {
+	nodeBase
 	db          *storage.Database
 	table       string
 	alias       string
@@ -76,6 +138,9 @@ func (n *seqScan) Next() (storage.Row, error) {
 	}
 	row := n.tuples[n.pos].Data
 	n.pos++
+	if n.log != nil {
+		n.log.Log(n.id, "Seq Scan", "scan", row)
+	}
 	return row, nil
 }
 
@@ -86,6 +151,7 @@ func (n *seqScan) Close() { n.tuples = nil }
 // =============================================================================
 
 type indexScan struct {
+	nodeBase
 	db          *storage.Database
 	table       string
 	alias       string
@@ -157,6 +223,9 @@ func (n *indexScan) Next() (storage.Row, error) {
 	}
 	row := n.tuples[n.pos].Data
 	n.pos++
+	if n.log != nil {
+		n.log.Log(n.id, "Index Scan", "scan", row)
+	}
 	return row, nil
 }
 
@@ -167,6 +236,7 @@ func (n *indexScan) Close() { n.tuples = nil }
 // =============================================================================
 
 type filterNode struct {
+	nodeBase
 	child Node
 	pred  parser.Expression
 }
@@ -191,7 +261,13 @@ func (n *filterNode) Next() (storage.Row, error) {
 			return nil, err
 		}
 		if boolVal(pass) {
+			if n.log != nil {
+				n.log.Log(n.id, "Filter", "pass", row)
+			}
 			return row, nil
+		}
+		if n.log != nil {
+			n.log.Log(n.id, "Filter", "reject", row)
 		}
 	}
 }
@@ -201,6 +277,7 @@ func (n *filterNode) Next() (storage.Row, error) {
 // =============================================================================
 
 type nestedLoopJoin struct {
+	nodeBase
 	outer        Node
 	inner        Node
 	cond         parser.Expression
@@ -312,6 +389,9 @@ func (n *nestedLoopJoin) Next() (storage.Row, error) {
 			}
 		}
 		n.emittedMatch = true
+		if n.log != nil {
+			n.log.Log(n.id, "Nested Loop", "match", combined)
+		}
 		return combined, nil
 	}
 }
@@ -326,6 +406,7 @@ type aggGroup struct {
 }
 
 type hashAggregate struct {
+	nodeBase
 	child       Node
 	groupBy     []string
 	selectExprs []parser.SelectExpr
@@ -438,6 +519,9 @@ func (n *hashAggregate) Next() (storage.Row, error) {
 	}
 	row := n.output[n.pos]
 	n.pos++
+	if n.log != nil {
+		n.log.Log(n.id, "HashAggregate", "emit", row)
+	}
 	return row, nil
 }
 
@@ -534,6 +618,7 @@ func computeAggFromRows(fn, arg string, rows []storage.Row) (interface{}, error)
 // =============================================================================
 
 type sortNode struct {
+	nodeBase
 	child   Node
 	orderBy []parser.OrderByExpr
 	rows    []storage.Row
@@ -587,6 +672,9 @@ func (n *sortNode) Next() (storage.Row, error) {
 	}
 	row := n.rows[n.pos]
 	n.pos++
+	if n.log != nil {
+		n.log.Log(n.id, "Sort", "emit", row)
+	}
 	return row, nil
 }
 
@@ -609,6 +697,7 @@ func resolveCol(row storage.Row, col string) interface{} {
 // =============================================================================
 
 type limitNode struct {
+	nodeBase
 	child   Node
 	limit   int64
 	offset  int64
@@ -643,9 +732,15 @@ func (n *limitNode) Next() (storage.Row, error) {
 		}
 		n.seen++
 		if n.seen <= n.offset {
+			if n.log != nil {
+				n.log.Log(n.id, "Limit", "skip", row)
+			}
 			continue
 		}
 		n.emitted++
+		if n.log != nil {
+			n.log.Log(n.id, "Limit", "pass", row)
+		}
 		return row, nil
 	}
 }
@@ -655,6 +750,7 @@ func (n *limitNode) Next() (storage.Row, error) {
 // =============================================================================
 
 type distinctNode struct {
+	nodeBase
 	child Node
 	seen  map[string]bool
 }
@@ -681,7 +777,13 @@ func (n *distinctNode) Next() (storage.Row, error) {
 		key := fmt.Sprintf("%v", row)
 		if !n.seen[key] {
 			n.seen[key] = true
+			if n.log != nil {
+				n.log.Log(n.id, "Unique", "pass", row)
+			}
 			return row, nil
+		}
+		if n.log != nil {
+			n.log.Log(n.id, "Unique", "dedup", row)
 		}
 	}
 }
@@ -702,6 +804,7 @@ func newInstrumentedNode(child Node) *instrumentedNode {
 
 func (n *instrumentedNode) NodeName() string     { return n.child.NodeName() }
 func (n *instrumentedNode) NodeChildren() []Node { return n.child.NodeChildren() }
+func (n *instrumentedNode) NodeID() int          { return n.child.NodeID() }
 
 func (n *instrumentedNode) Open() error {
 	t := time.Now()

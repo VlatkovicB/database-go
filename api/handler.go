@@ -23,14 +23,17 @@ type TraceToken struct {
 }
 
 type QueryResponse struct {
-	Columns   []string        `json:"columns,omitempty"`
-	Rows      [][]interface{} `json:"rows,omitempty"`
-	Message   string          `json:"message,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	Tokens    []TraceToken    `json:"tokens,omitempty"`
-	AST       interface{}     `json:"ast,omitempty"`
-	ExecTrace []string        `json:"execTrace,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
+	Columns       []string               `json:"columns,omitempty"`
+	Rows          [][]interface{}        `json:"rows,omitempty"`
+	Message       string                 `json:"message,omitempty"`
+	Error         string                 `json:"error,omitempty"`
+	Tokens        []TraceToken           `json:"tokens,omitempty"`
+	AST           interface{}            `json:"ast,omitempty"`
+	ExecTrace     []string               `json:"execTrace,omitempty"`
+	SessionID     string                 `json:"session_id,omitempty"`
+	StepLog       []executor.StepEvent   `json:"stepLog,omitempty"`
+	NodeTree      *executor.NodeTreeDesc `json:"nodeTree,omitempty"`
+	StepTruncated bool                   `json:"stepTruncated,omitempty"`
 }
 
 // Handler holds the shared database and an in-memory session store.
@@ -181,13 +184,16 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, QueryResponse{
-		Columns:   result.Columns,
-		Rows:      result.Rows,
-		Message:   result.Message,
-		Tokens:    traceTokens,
-		AST:       ast,
-		ExecTrace: result.Trace,
-		SessionID: sessionID,
+		Columns:       result.Columns,
+		Rows:          result.Rows,
+		Message:       result.Message,
+		Tokens:        traceTokens,
+		AST:           ast,
+		ExecTrace:     result.Trace,
+		SessionID:     sessionID,
+		StepLog:       result.StepLog,
+		NodeTree:      result.NodeTree,
+		StepTruncated: result.StepTruncated,
 	})
 }
 

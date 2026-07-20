@@ -22,7 +22,7 @@ internal/
   storage/    # In-memory tables, sync.RWMutex protected
   executor/   # Walks AST, evaluates WHERE/GROUP BY/ORDER BY/LIMIT/OFFSET
 api/
-  handler.go  # POST /query, GET /tables HTTP handlers
+  handler.go  # POST /query, GET /tables, GET /wal, POST /wal/* HTTP handlers
   seed.go     # POST /seed — repopulates game DB (10 tables, ~277 rows)
 cmd/server/
   main.go     # Entry point, registers routes
@@ -89,6 +89,10 @@ VACUUM players;  -- reclaim dead tuples left by committed DELETEs/UPDATEs
 - `GET /tables` — all tables with column schema and row counts
 - `POST /seed` — drop + recreate all 10 game tables, returns `{ok, errors}`
 - `POST /vacuum` — `{"table": "players"}` → `{"reclaimed": N}`
+- `GET /wal` — all WAL records + checkpointLSN
+- `POST /wal/checkpoint` — snapshot current DB state
+- `POST /wal/crash` — revert DB to last checkpoint (crash simulation)
+- `POST /wal/recover` — replay WAL since checkpoint (crash recovery)
 
 `session_id` is optional. `BEGIN` creates a new session and returns its ID. Pass it in subsequent queries for multi-statement transactions.
 
@@ -104,6 +108,7 @@ VACUUM players;  -- reclaim dead tuples left by committed DELETEs/UPDATEs
 | Column statistics | `internal/storage/stats.go` | `ColumnStats` (NDistinct, NullFrac, Histogram, MCV), `TableStats`, `computeStats()` |
 | HTTP handlers | `api/handler.go` | `Handler` struct with session store; `stmtToTrace()` / `exprToTrace()` serialize AST to JSON |
 | MVCC | `internal/storage/mvcc.go` | `TxManager`, `Transaction`, `Snapshot`, `Visible()` — PG snapshot isolation rules |
+| WAL | `internal/storage/wal.go` | `WALManager`, `WALRecord`, `WALOp`; `TakeCheckpoint`, `RestoreCheckpoint`, `Replay` |
 | Seed data | `api/seed.go` | `seedStatements []string` — 10 game tables |
 | Frontend | `cmd/server/web/index.html` | Pipeline animation, exec-order panel, Seed + Format buttons |
 

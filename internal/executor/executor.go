@@ -631,6 +631,7 @@ func (e *Executor) execInsert(s *parser.InsertStatement) (*Result, error) {
 	if err := e.db.Insert(s.Table, row, xid); err != nil {
 		return nil, err
 	}
+	e.db.WAL.Append(xid, storage.WALInsert, s.Table, nil, []storage.Row{row})
 	traceXmin := "xmin=0 (auto-commit)"
 	if xid != 0 {
 		traceXmin = fmt.Sprintf("xmin=%d", xid)
@@ -646,7 +647,7 @@ func (e *Executor) execInsert(s *parser.InsertStatement) (*Result, error) {
 
 func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
 	xid := e.currentXID()
-	count, err := e.db.UpdateRows(s.Table,
+	count, oldRows, newRows, err := e.db.UpdateRows(s.Table,
 		func(row storage.Row) bool {
 			if s.Where == nil {
 				return true
@@ -668,6 +669,9 @@ func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
 	)
 	if err != nil {
 		return nil, err
+	}
+	if count > 0 {
+		e.db.WAL.Append(xid, storage.WALUpdate, s.Table, oldRows, newRows)
 	}
 	whereDesc := "none (all rows)"
 	if s.Where != nil {
@@ -691,7 +695,7 @@ func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
 
 func (e *Executor) execDelete(s *parser.DeleteStatement) (*Result, error) {
 	xid := e.currentXID()
-	count, err := e.db.DeleteRows(s.Table, func(row storage.Row) bool {
+	count, deletedRows, err := e.db.DeleteRows(s.Table, func(row storage.Row) bool {
 		if s.Where == nil {
 			return true
 		}
@@ -700,6 +704,9 @@ func (e *Executor) execDelete(s *parser.DeleteStatement) (*Result, error) {
 	}, xid)
 	if err != nil {
 		return nil, err
+	}
+	if count > 0 {
+		e.db.WAL.Append(xid, storage.WALDelete, s.Table, deletedRows, nil)
 	}
 	whereDesc := "none (all rows)"
 	if s.Where != nil {
@@ -807,6 +814,7 @@ func (e *Executor) execBegin() (*Result, error) {
 		return nil, fmt.Errorf("there is already an open transaction (xid=%d)", e.CurrentTx.ID)
 	}
 	e.CurrentTx = e.db.TxManager.Begin()
+	e.db.WAL.Append(e.CurrentTx.ID, storage.WALBegin, "", nil, nil)
 	return &Result{
 		Message: "BEGIN",
 		Trace: []string{
@@ -827,6 +835,7 @@ func (e *Executor) execCommit() (*Result, error) {
 	if err := e.db.TxManager.Commit(xid); err != nil {
 		return nil, err
 	}
+	e.db.WAL.Append(xid, storage.WALCommit, "", nil, nil)
 	e.CurrentTx = nil
 	return &Result{
 		Message: "COMMIT",
@@ -845,6 +854,7 @@ func (e *Executor) execRollback() (*Result, error) {
 	if err := e.db.TxManager.Abort(xid); err != nil {
 		return nil, err
 	}
+	e.db.WAL.Append(xid, storage.WALRollback, "", nil, nil)
 	e.CurrentTx = nil
 	return &Result{
 		Message: "ROLLBACK",

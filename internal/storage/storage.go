@@ -54,15 +54,17 @@ type Table struct {
 }
 
 type Database struct {
-	mu       sync.RWMutex
-	Tables   map[string]*Table
+	mu        sync.RWMutex
+	Tables    map[string]*Table
 	TxManager *TxManager
+	WAL       *WALManager
 }
 
 func New() *Database {
 	return &Database{
 		Tables:    make(map[string]*Table),
 		TxManager: NewTxManager(),
+		WAL:       NewWALManager(),
 	}
 }
 
@@ -310,14 +312,16 @@ func (db *Database) PageCount(tableName string) (int, error) {
 // UpdateRows implements MVCC-style update: marks matching tuples dead (Xmax=xid)
 // and inserts new tuple versions with Xmin=xid.
 // xid==0 falls back to in-place mutation for auto-commit mode.
-func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, update func(Row) Row, xid uint64) (int, error) {
+// Returns (count, oldRows, newRows, error) for WAL logging by the caller.
+func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, update func(Row) Row, xid uint64) (int, []Row, []Row, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	t, ok := db.Tables[tableName]
 	if !ok {
-		return 0, fmt.Errorf("table %q does not exist", tableName)
+		return 0, nil, nil, fmt.Errorf("table %q does not exist", tableName)
 	}
 	count := 0
+	var oldRows []Row
 	var newRows []Row
 	for i := range t.Pages {
 		for j := range t.Pages[i].Tuples {
@@ -328,6 +332,10 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 			if !predicate(tpl.Data) {
 				continue
 			}
+			oldCopy := make(Row, len(tpl.Data))
+			for k, v := range tpl.Data {
+				oldCopy[k] = v
+			}
 			newRow := update(tpl.Data)
 			if xid == 0 {
 				// Auto-commit: mutate in place (legacy behaviour)
@@ -337,12 +345,12 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 				tpl.Xmax = xid
 				newRows = append(newRows, newRow)
 			}
+			oldRows = append(oldRows, oldCopy)
 			count++
 		}
 	}
 	// Append new tuple versions for MVCC updates
 	for _, row := range newRows {
-		// find last page with room
 		if len(t.Pages) > 0 {
 			last := &t.Pages[len(t.Pages)-1]
 			if len(last.Tuples) < t.tuplesPerPage {
@@ -357,7 +365,11 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 		t.Pages = append(t.Pages, pg)
 	}
 	t.rebuildIndexes()
-	return count, nil
+	if xid == 0 {
+		// For auto-commit, newRows == oldRows (in-place), return the updated rows
+		newRows = oldRows
+	}
+	return count, oldRows, newRows, nil
 }
 
 type TableInfo struct {
@@ -537,12 +549,13 @@ func (db *Database) GetTableStats(name string) *TableStats {
 
 // DeleteRows implements MVCC-style delete: stamps matching live tuples with Xmax=xid.
 // When xid==0 (auto-commit), physically removes rows (legacy behaviour).
-func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid uint64) (int, error) {
+// Returns (count, deletedRows, error) for WAL logging by the caller.
+func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid uint64) (int, []Row, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	t, ok := db.Tables[tableName]
 	if !ok {
-		return 0, fmt.Errorf("table %q does not exist", tableName)
+		return 0, nil, fmt.Errorf("table %q does not exist", tableName)
 	}
 
 	// Check FK: no child table may reference rows we're about to delete
@@ -563,7 +576,7 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 								continue
 							}
 							if ctpl.Data[fk.Column] == val {
-								return 0, fmt.Errorf("delete violates foreign key constraint: %q.%q=%v is referenced by %q.%q", tableName, fk.RefColumn, val, childName, fk.Column)
+								return 0, nil, fmt.Errorf("delete violates foreign key constraint: %q.%q=%v is referenced by %q.%q", tableName, fk.RefColumn, val, childName, fk.Column)
 							}
 						}
 					}
@@ -573,6 +586,7 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 	}
 
 	deleted := 0
+	var deletedRows []Row
 
 	if xid != 0 {
 		// MVCC: mark matching live tuples as deleted
@@ -583,13 +597,18 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 					continue // already dead
 				}
 				if predicate(tpl.Data) {
+					rowCopy := make(Row, len(tpl.Data))
+					for k, v := range tpl.Data {
+						rowCopy[k] = v
+					}
+					deletedRows = append(deletedRows, rowCopy)
 					tpl.Xmax = xid
 					deleted++
 				}
 			}
 		}
 		t.rebuildIndexes()
-		return deleted, nil
+		return deleted, deletedRows, nil
 	}
 
 	// Auto-commit (xid==0): physical removal for backward compat
@@ -600,6 +619,11 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 				continue // skip already-dead tuples
 			}
 			if predicate(tuple.Data) {
+				rowCopy := make(Row, len(tuple.Data))
+				for k, v := range tuple.Data {
+					rowCopy[k] = v
+				}
+				deletedRows = append(deletedRows, rowCopy)
 				deleted++
 			} else {
 				kept = append(kept, tuple.Data)
@@ -621,7 +645,7 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 		kept = kept[end:]
 	}
 	t.rebuildIndexes()
-	return deleted, nil
+	return deleted, deletedRows, nil
 }
 
 // Vacuum physically removes tuples that are dead (Xmax != 0) and whose deleting

@@ -286,6 +286,49 @@
 
   .pipeline-collapsed .stage-body { display: none; }
 
+  /* WAL panel */
+  .wal-panel { margin-bottom: 24px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+  .wal-panel.crashed { border-color: #da3633; animation: crashFlash 0.4s ease; }
+  @keyframes crashFlash { 0%,100%{border-color:#da3633} 25%,75%{border-color:#f85149} 50%{border-color:#ff6b6b} }
+  .wal-panel-header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #21262d; background: #161b22; }
+  .wal-panel-title { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; flex: 1; }
+  .wal-status { color: #8b949e; font-size: 11px; }
+  .wal-status .wal-cp-lsn { color: #d2a8ff; }
+  .wal-status .wal-since { color: #ffa657; }
+  .wal-btn-group { display: flex; gap: 6px; }
+  .wal-btn { background: transparent; border: 1px solid #21262d; padding: 4px 10px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 11px; border-radius: 4px; transition: all 0.15s; white-space: nowrap; }
+  .wal-btn.checkpoint { color: #d2a8ff; }
+  .wal-btn.checkpoint:hover { border-color: #d2a8ff; background: #1a0d3a; }
+  .wal-btn.crash { color: #f85149; }
+  .wal-btn.crash:hover { border-color: #f85149; background: #2d0d0d; }
+  .wal-btn.recover { color: #3fb950; }
+  .wal-btn.recover:hover { border-color: #3fb950; background: #0d2d1a; }
+  .wal-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .wal-body { overflow-x: auto; max-height: 260px; overflow-y: auto; }
+  .wal-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .wal-table th { background: #0d1117; color: #484f58; text-align: left; padding: 6px 12px; border-bottom: 1px solid #21262d; white-space: nowrap; font-weight: normal; letter-spacing: 0.5px; font-size: 10px; text-transform: uppercase; }
+  .wal-table td { padding: 5px 12px; border-bottom: 1px solid #161b22; white-space: nowrap; font-family: 'Courier New', monospace; }
+  .wal-table tr:last-child td { border-bottom: none; }
+  .wal-table tr.wal-new td { background: #0d2d1a; animation: walRow 0.3s ease; }
+  .wal-table tr.wal-cp td { background: #1a0d3a; }
+  @keyframes walRow { from { opacity: 0; background: #0d3d1a; } to { opacity: 1; } }
+  .wal-lsn { color: #484f58; }
+  .wal-xid { color: #8b949e; }
+  .wal-op { font-weight: bold; }
+  .wal-op.INSERT { color: #3fb950; }
+  .wal-op.UPDATE { color: #58a6ff; }
+  .wal-op.DELETE { color: #f85149; }
+  .wal-op.BEGIN { color: #ffa657; }
+  .wal-op.COMMIT { color: #ffa657; }
+  .wal-op.ROLLBACK { color: #ffa657; }
+  .wal-op.CHECKPOINT { color: #d2a8ff; }
+  .wal-tbl { color: #7ee787; }
+  .wal-detail { color: #8b949e; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .wal-time { color: #484f58; font-size: 11px; }
+  .wal-empty { color: #484f58; font-size: 12px; font-style: italic; padding: 16px 14px; }
+  .wal-crashed-banner { background: #2d0d0d; border-bottom: 1px solid #da3633; color: #f85149; font-size: 12px; padding: 8px 14px; display: none; }
+  .wal-crashed-banner.visible { display: block; }
+
   /* Index Advisor panel */
   .idx-panel { margin-bottom: 24px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
   .idx-panel-header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #21262d; background: #161b22; }
@@ -374,6 +417,9 @@
         </div>
         <div class="stoggle" id="stoggle-index-advisor" onclick="toggleSection('index-advisor')">
           <span class="stoggle-ind"></span><span>Index Advisor</span>
+        </div>
+        <div class="stoggle on" id="stoggle-wal" onclick="toggleSection('wal')">
+          <span class="stoggle-ind"></span><span>WAL Log</span>
         </div>
       </div>
     </div>
@@ -488,6 +534,29 @@
         <div class="idx-body" id="idxBody"></div>
       </div>
 
+      <!-- WAL panel -->
+      <div class="wal-panel" id="walPanel">
+        <div class="wal-panel-header">
+          <span class="wal-panel-title">Write-Ahead Log</span>
+          <span class="wal-status" id="walStatus"></span>
+          <div class="wal-btn-group">
+            <button class="wal-btn checkpoint" onclick="takeCheckpoint()" title="Snapshot current DB state to WAL">Checkpoint</button>
+            <button class="wal-btn crash" onclick="crashDB()" id="crashBtn" title="Simulate crash — revert to last checkpoint">Crash</button>
+            <button class="wal-btn recover" onclick="recoverDB()" id="recoverBtn" title="Replay WAL to recover committed data">Recover</button>
+          </div>
+        </div>
+        <div class="wal-crashed-banner" id="walCrashedBanner">⚡ CRASHED — DB reverted to checkpoint. Run Recover to replay WAL and restore committed data.</div>
+        <div class="wal-body">
+          <div id="walEmpty" class="wal-empty">No WAL records yet — run INSERT, UPDATE, DELETE, or BEGIN/COMMIT to generate records.</div>
+          <table class="wal-table" id="walTable" style="display:none">
+            <thead><tr>
+              <th>LSN</th><th>XID</th><th>OP</th><th>Table</th><th>Detail</th><th>Time</th>
+            </tr></thead>
+            <tbody id="walBody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Query result -->
       <div id="result"></div>
 
@@ -505,10 +574,10 @@ const queryHistory = [];
 let pipelineCollapsed = false;
 
 // Section visibility — persisted in localStorage
-const SECTION_KEYS = ['lexer', 'parser', 'executor', 'exec-order', 'stepthrough', 'index-advisor'];
+const SECTION_KEYS = ['lexer', 'parser', 'executor', 'exec-order', 'stepthrough', 'index-advisor', 'wal'];
 const sectionVisible = (() => {
   const saved = JSON.parse(localStorage.getItem('minidb-sections') || '{}');
-  const defaults = { lexer: true, parser: true, executor: true, 'exec-order': true, stepthrough: true, 'index-advisor': true };
+  const defaults = { lexer: true, parser: true, executor: true, 'exec-order': true, stepthrough: true, 'index-advisor': true, wal: true };
   return Object.assign(defaults, saved);
 })();
 
@@ -549,6 +618,9 @@ function applySectionVisibility() {
   } else if (idxPanel && idxPanel.dataset.hasData === '1' && sectionVisible['index-advisor']) {
     idxPanel.style.display = '';
   }
+  // wal panel: always visible when enabled
+  const walPanel = document.getElementById('walPanel');
+  if (walPanel) walPanel.style.display = sectionVisible['wal'] ? '' : 'none';
   // sync toggle indicators in sidebar
   SECTION_KEYS.forEach(k => {
     const el = document.getElementById('stoggle-' + k);
@@ -632,6 +704,7 @@ async function runQuery() {
     }
 
     refreshTables(data);
+    fetchWAL();
   } catch (err) {
     document.getElementById('result').innerHTML = `<div class="msg err">✗ Connection error: ${esc(err.message)}</div>`;
   } finally {
@@ -1213,12 +1286,135 @@ async function seedDB() {
     const errs = data.errors && data.errors.length ? ` (${data.errors.length} skipped)` : '';
     btn.textContent = `✓ Seeded ${data.ok} rows${errs}`;
     fetchTables();
+    fetchWAL();
     setTimeout(() => { btn.textContent = '⚡ Seed Game DB'; btn.disabled = false; }, 3000);
   } catch (e) {
     btn.textContent = '✗ Failed';
     setTimeout(() => { btn.textContent = '⚡ Seed Game DB'; btn.disabled = false; }, 2000);
   }
 }
+
+// ── WAL ──────────────────────────────────────────────────────────────────────
+
+let walCrashed = false;
+let lastWalLSNs = new Set();
+
+async function fetchWAL() {
+  try {
+    const res = await fetch('/wal');
+    const data = await res.json();
+    renderWAL(data);
+  } catch (e) { /* ignore */ }
+}
+
+function renderWAL(data) {
+  const records = data.records || [];
+  const cpLSN = data.checkpointLSN || 0;
+  const tbody = document.getElementById('walBody');
+  const empty = document.getElementById('walEmpty');
+  const table = document.getElementById('walTable');
+  const status = document.getElementById('walStatus');
+
+  // Status line
+  const sinceCP = records.filter(r => r.lsn > cpLSN).length;
+  if (cpLSN > 0) {
+    status.innerHTML = `checkpoint at LSN <span class="wal-cp-lsn">${cpLSN}</span> · <span class="wal-since">${sinceCP} record(s) since</span>`;
+  } else {
+    status.innerHTML = `<span class="wal-since">no checkpoint yet</span>`;
+  }
+
+  if (records.length === 0) {
+    empty.style.display = '';
+    table.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  table.style.display = '';
+
+  const newLSNs = new Set(records.map(r => r.lsn));
+  tbody.innerHTML = records.map(r => {
+    const isNew = !lastWalLSNs.has(r.lsn);
+    const isCP = r.op === 'CHECKPOINT';
+    let detail = '';
+    if (r.op === 'INSERT' && r.newRows && r.newRows.length) {
+      detail = rowSummary(r.newRows[0]);
+    } else if (r.op === 'UPDATE' && r.newRows && r.newRows.length) {
+      detail = `${r.oldRows.length} row(s) → ${r.newRows.length} new version(s)`;
+    } else if (r.op === 'DELETE' && r.oldRows && r.oldRows.length) {
+      detail = `${r.oldRows.length} row(s) deleted`;
+    }
+    const t = new Date(r.timestamp);
+    const timeStr = t.toLocaleTimeString('en', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const xidStr = r.xid > 0 ? r.xid : '—';
+    return `<tr class="${isNew ? 'wal-new' : ''} ${isCP ? 'wal-cp' : ''}">
+      <td class="wal-lsn">${r.lsn}</td>
+      <td class="wal-xid">${xidStr}</td>
+      <td class="wal-op ${r.op}">${r.op}</td>
+      <td class="wal-tbl">${r.table ? esc(r.table) : '—'}</td>
+      <td class="wal-detail">${esc(detail)}</td>
+      <td class="wal-time">${timeStr}</td>
+    </tr>`;
+  }).join('');
+
+  lastWalLSNs = newLSNs;
+
+  // Auto-scroll to bottom
+  const walBody = document.querySelector('.wal-body');
+  if (walBody) walBody.scrollTop = walBody.scrollHeight;
+}
+
+function rowSummary(row) {
+  if (!row) return '';
+  const pairs = Object.entries(row).slice(0, 4).map(([k, v]) => `${k}=${v}`);
+  return pairs.join(', ');
+}
+
+async function takeCheckpoint() {
+  try {
+    const res = await fetch('/wal/checkpoint', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    walCrashed = false;
+    document.getElementById('walCrashedBanner').classList.remove('visible');
+    document.getElementById('walPanel').classList.remove('crashed');
+    fetchWAL();
+  } catch (e) { alert('Checkpoint failed: ' + e.message); }
+}
+
+async function crashDB() {
+  try {
+    const res = await fetch('/wal/crash', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    walCrashed = true;
+    document.getElementById('walCrashedBanner').classList.add('visible');
+    const panel = document.getElementById('walPanel');
+    panel.classList.add('crashed');
+    setTimeout(() => panel.classList.remove('crashed'), 500);
+    fetchTables();
+    fetchWAL();
+  } catch (e) { alert('Crash simulation failed: ' + e.message); }
+}
+
+async function recoverDB() {
+  if (!walCrashed) {
+    alert('Run Crash first to simulate a crash, then Recover will replay the WAL.');
+    return;
+  }
+  try {
+    const res = await fetch('/wal/recover', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    walCrashed = false;
+    document.getElementById('walCrashedBanner').classList.remove('visible');
+    fetchTables();
+    fetchWAL();
+    document.getElementById('result').innerHTML = `<div class="msg ok">✓ ${esc(data.message)}</div>`;
+  } catch (e) { alert('Recovery failed: ' + e.message); }
+}
+
+// Initial WAL load
+fetchWAL();
 
 function esc(str) {
   return String(str)

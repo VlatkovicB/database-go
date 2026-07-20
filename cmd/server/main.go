@@ -28,6 +28,10 @@ func main() {
 	mux.HandleFunc("/tables", api.TablesHandler(db))
 	mux.HandleFunc("/seed", api.SeedHandler(db))
 	mux.HandleFunc("/vacuum", api.VacuumHandler(db))
+	mux.HandleFunc("/wal", api.WALHandler(db))
+	mux.HandleFunc("/wal/checkpoint", api.WALCheckpointHandler(db))
+	mux.HandleFunc("/wal/crash", api.WALCrashHandler(db))
+	mux.HandleFunc("/wal/recover", api.WALRecoverHandler(db))
 
 	// Serve frontend from embedded web/ directory.
 	webFS, err := fs.Sub(webFiles, "web")

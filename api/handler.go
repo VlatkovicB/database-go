@@ -484,6 +484,79 @@ func VacuumHandler(db *storage.Database) http.HandlerFunc {
 	}
 }
 
+// WALHandler handles GET /wal — returns all WAL records and checkpoint info.
+func WALHandler(db *storage.Database) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		records := db.WAL.Records()
+		writeJSON(w, map[string]interface{}{
+			"records":       records,
+			"checkpointLSN": db.WAL.CheckpointLSN(),
+			"hasCheckpoint": db.WAL.HasCheckpoint(),
+		})
+	}
+}
+
+// WALCheckpointHandler handles POST /wal/checkpoint — takes a checkpoint.
+func WALCheckpointHandler(db *storage.Database) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method != http.MethodPost {
+			writeJSON(w, map[string]interface{}{"error": "only POST allowed"})
+			return
+		}
+		rec := db.WAL.TakeCheckpoint(db)
+		writeJSON(w, map[string]interface{}{
+			"lsn":     rec.LSN,
+			"message": fmt.Sprintf("CHECKPOINT written at LSN %d", rec.LSN),
+		})
+	}
+}
+
+// WALCrashHandler handles POST /wal/crash — simulates a crash by restoring to last checkpoint.
+func WALCrashHandler(db *storage.Database) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method != http.MethodPost {
+			writeJSON(w, map[string]interface{}{"error": "only POST allowed"})
+			return
+		}
+		ok := db.WAL.RestoreCheckpoint(db)
+		if !ok {
+			writeJSON(w, map[string]interface{}{"error": "no checkpoint exists — take a checkpoint first"})
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok":      true,
+			"message": fmt.Sprintf("CRASH simulated — DB reverted to checkpoint LSN %d", db.WAL.CheckpointLSN()),
+		})
+	}
+}
+
+// WALRecoverHandler handles POST /wal/recover — replays WAL since last checkpoint.
+func WALRecoverHandler(db *storage.Database) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method != http.MethodPost {
+			writeJSON(w, map[string]interface{}{"error": "only POST allowed"})
+			return
+		}
+		replayed, err := db.WAL.Replay(db)
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"replayed": replayed,
+			"message":  fmt.Sprintf("RECOVERY complete — replayed %d WAL record(s)", replayed),
+		})
+	}
+}
+
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }

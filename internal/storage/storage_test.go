@@ -107,7 +107,7 @@ func TestUpdateRows(t *testing.T) {
 	db.Insert("users", Row{"id": int64(1), "name": "Alice", "age": int64(30)}, 0)
 	db.Insert("users", Row{"id": int64(2), "name": "Bob", "age": int64(25)}, 0)
 
-	count, err := db.UpdateRows("users",
+	count, _, _, err := db.UpdateRows("users",
 		func(r Row) bool { return r["name"] == "Alice" },
 		func(r Row) Row {
 			n := Row{"id": r["id"], "name": r["name"], "age": int64(31)}
@@ -132,7 +132,7 @@ func TestUpdateNoMatch(t *testing.T) {
 	createUsersTable(t, db)
 	db.Insert("users", Row{"id": int64(1), "name": "Alice", "age": int64(30)}, 0)
 
-	count, err := db.UpdateRows("users",
+	count, _, _, err := db.UpdateRows("users",
 		func(r Row) bool { return r["name"] == "Nobody" },
 		func(r Row) Row { return r },
 		0,
@@ -150,7 +150,7 @@ func TestDeleteRows(t *testing.T) {
 	db.Insert("users", Row{"id": int64(1), "name": "Alice", "age": int64(30)}, 0)
 	db.Insert("users", Row{"id": int64(2), "name": "Bob", "age": int64(20)}, 0)
 
-	count, err := db.DeleteRows("users", func(r Row) bool {
+	count, _, err := db.DeleteRows("users", func(r Row) bool {
 		return r["age"].(int64) < 25
 	}, 0)
 	if err != nil || count != 1 {

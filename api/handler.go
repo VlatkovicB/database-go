@@ -41,21 +41,40 @@ type QueryResponse struct {
 // open transaction (BEGIN has been called but COMMIT/ROLLBACK not yet).
 type Handler struct {
 	db       *storage.Database
+	history  *HistoryStore
 	mu       sync.Mutex
 	sessions map[string]*executor.Executor
 }
 
-func NewHandler(db *storage.Database) *Handler {
+func NewHandler(db *storage.Database, history *HistoryStore) *Handler {
 	return &Handler{
 		db:       db,
+		history:  history,
 		sessions: make(map[string]*executor.Executor),
 	}
 }
 
 // QueryHandler returns an http.HandlerFunc backed by a Handler with session support.
-func QueryHandler(db *storage.Database) http.HandlerFunc {
-	h := NewHandler(db)
+func QueryHandler(db *storage.Database, history *HistoryStore) http.HandlerFunc {
+	h := NewHandler(db, history)
 	return h.handleQuery
+}
+
+// HistoryHandler handles GET /history.
+func HistoryHandler(history *HistoryStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		queries, err := history.List()
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"error": err.Error()})
+			return
+		}
+		if queries == nil {
+			queries = []string{}
+		}
+		writeJSON(w, map[string]interface{}{"queries": queries})
+	}
 }
 
 func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +134,9 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		h.sessions[sessionID] = exec
 		h.mu.Unlock()
+		if h.history != nil {
+			go h.history.Upsert(req.SQL)
+		}
 		writeJSON(w, QueryResponse{
 			Message:   result.Message,
 			Tokens:    traceTokens,
@@ -183,6 +205,9 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.history != nil {
+		go h.history.Upsert(req.SQL)
+	}
 	writeJSON(w, QueryResponse{
 		Columns:       result.Columns,
 		Rows:          result.Rows,

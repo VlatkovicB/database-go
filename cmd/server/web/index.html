@@ -23,10 +23,17 @@
 
   /* Sidebar */
   .sidebar { width: 220px; background: #0d1117; border-right: 1px solid #21262d; flex-shrink: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .sidebar-tables { flex: 1; overflow-y: auto; padding: 12px 0 0; }
+  .sidebar-section { display: flex; flex-direction: column; flex-shrink: 0; }
+  .sidebar-section.grows { flex: 1; overflow: hidden; }
   .sidebar-sep { border-top: 1px solid #21262d; margin: 4px 0; flex-shrink: 0; }
-  .sidebar-panels { flex-shrink: 0; padding: 4px 0 12px; }
-  .sidebar-head { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 0 14px 10px; }
+  .sidebar-head { color: #484f58; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 8px 14px; cursor: pointer; user-select: none; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; transition: color 0.1s; }
+  .sidebar-head:hover { color: #8b949e; }
+  .sidebar-head-arrow { font-size: 10px; transition: transform 0.15s; }
+  .sidebar-head-arrow.open { transform: rotate(90deg); }
+  .sidebar-section-body { overflow: hidden; }
+  .sidebar-section-body.tables-body { flex: 1; overflow-y: auto; padding: 4px 0 8px; }
+  .sidebar-section-body.panels-body { padding: 4px 0 12px; }
+  .sidebar-section-body.collapsed { display: none; }
   .no-tables { color: #484f58; font-size: 12px; font-style: italic; padding: 0 14px; }
 
   .stoggle {
@@ -259,6 +266,23 @@
   .hist-item:hover { border-color: #388bfd; color: #c9d1d9; }
   .hist-item .htime { color: #484f58; font-size: 11px; flex-shrink: 0; margin-left: 12px; }
 
+  /* Autocomplete dropdown */
+  .ac-wrap { position: relative; }
+  #ac-list {
+    display: none; position: absolute; z-index: 100;
+    top: 100%; left: 0; right: 0;
+    background: #161b22; border: 1px solid #388bfd;
+    border-top: none; border-radius: 0 0 6px 6px;
+    max-height: 200px; overflow-y: auto;
+  }
+  #ac-list.open { display: block; }
+  .ac-item {
+    padding: 7px 14px; font-size: 13px; color: #8b949e;
+    cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    transition: background 0.1s, color 0.1s;
+  }
+  .ac-item:hover, .ac-item.active { background: #21262d; color: #c9d1d9; }
+
   .pipeline-collapsed .stage-body { display: none; }
 
   /* Step-through panel */
@@ -313,34 +337,47 @@
 </header>
 <div class="layout">
   <aside class="sidebar">
-    <div class="sidebar-tables">
-      <div class="sidebar-head">Tables</div>
-      <div id="tableList"><span class="no-tables">none yet</span></div>
+    <div class="sidebar-section">
+      <div class="sidebar-head" onclick="toggleSidebarSection('panels')">
+        <span>Panels</span>
+        <span class="sidebar-head-arrow open" id="sidebar-arrow-panels">▶</span>
+      </div>
+      <div class="sidebar-section-body panels-body" id="sidebar-body-panels">
+        <div class="stoggle" id="stoggle-lexer" onclick="toggleSection('lexer')">
+          <span class="stoggle-ind"></span><span>Lexer</span>
+        </div>
+        <div class="stoggle" id="stoggle-parser" onclick="toggleSection('parser')">
+          <span class="stoggle-ind"></span><span>Parser</span>
+        </div>
+        <div class="stoggle" id="stoggle-executor" onclick="toggleSection('executor')">
+          <span class="stoggle-ind"></span><span>Executor</span>
+        </div>
+        <div class="stoggle" id="stoggle-exec-order" onclick="toggleSection('exec-order')">
+          <span class="stoggle-ind"></span><span>SQL Execution Order</span>
+        </div>
+        <div class="stoggle" id="stoggle-stepthrough" onclick="toggleSection('stepthrough')">
+          <span class="stoggle-ind"></span><span>Step Through</span>
+        </div>
+      </div>
     </div>
     <div class="sidebar-sep"></div>
-    <div class="sidebar-panels">
-      <div class="sidebar-head">Panels</div>
-      <div class="stoggle" id="stoggle-lexer" onclick="toggleSection('lexer')">
-        <span class="stoggle-ind"></span><span>Lexer</span>
+    <div class="sidebar-section grows">
+      <div class="sidebar-head" onclick="toggleSidebarSection('tables')">
+        <span>Tables</span>
+        <span class="sidebar-head-arrow open" id="sidebar-arrow-tables">▶</span>
       </div>
-      <div class="stoggle" id="stoggle-parser" onclick="toggleSection('parser')">
-        <span class="stoggle-ind"></span><span>Parser</span>
-      </div>
-      <div class="stoggle" id="stoggle-executor" onclick="toggleSection('executor')">
-        <span class="stoggle-ind"></span><span>Executor</span>
-      </div>
-      <div class="stoggle" id="stoggle-exec-order" onclick="toggleSection('exec-order')">
-        <span class="stoggle-ind"></span><span>SQL Execution Order</span>
-      </div>
-      <div class="stoggle" id="stoggle-stepthrough" onclick="toggleSection('stepthrough')">
-        <span class="stoggle-ind"></span><span>Step Through</span>
+      <div class="sidebar-section-body tables-body" id="sidebar-body-tables">
+        <div id="tableList"><span class="no-tables">none yet</span></div>
       </div>
     </div>
   </aside>
   <div class="main">
     <div class="editor-wrap">
       <div class="editor-label">SQL Query</div>
-      <textarea id="query" placeholder="SELECT * FROM users WHERE age > 25;" spellcheck="false"></textarea>
+      <div class="ac-wrap">
+        <textarea id="query" placeholder="SELECT * FROM users WHERE age > 25;" spellcheck="false"></textarea>
+        <div id="ac-list"></div>
+      </div>
     </div>
     <div class="controls">
       <button class="run" id="runBtn" onclick="runQuery()">▶ Run</button>
@@ -453,6 +490,13 @@ function saveSectionPrefs() {
   localStorage.setItem('minidb-sections', JSON.stringify(sectionVisible));
 }
 
+function toggleSidebarSection(key) {
+  const body = document.getElementById('sidebar-body-' + key);
+  const arrow = document.getElementById('sidebar-arrow-' + key);
+  const nowCollapsed = body.classList.toggle('collapsed');
+  arrow.classList.toggle('open', !nowCollapsed);
+}
+
 function toggleSection(key) {
   sectionVisible[key] = !sectionVisible[key];
   saveSectionPrefs();
@@ -488,9 +532,8 @@ let speed = sliderToSpeed(70);
 
 function sliderToSpeed(v) {
   v = Number(v);
-  if (v === 0) return { tokenStep: 0, tokenSettle: 0, parserSettle: 0, execStep: 0, execSettle: 0 };
-  // map 1-100 exponentially to 1-200ms range
-  const t = Math.round(Math.pow(v / 100, 2.5) * 200);
+  if (v === 100) return { tokenStep: 0, tokenSettle: 0, parserSettle: 0, execStep: 0, execSettle: 0 };
+  const t = Math.round(Math.pow((100 - v) / 100, 2.5) * 200);
   return {
     tokenStep:    t,
     tokenSettle:  Math.round(t * 2.5),
@@ -502,10 +545,10 @@ function sliderToSpeed(v) {
 
 function sliderLabel(v) {
   v = Number(v);
-  if (v === 0)   return 'instant';
-  if (v <= 20)   return 'fast';
-  if (v <= 50)   return 'normal';
-  if (v <= 75)   return 'slow';
+  if (v === 100) return 'instant';
+  if (v >= 75)   return 'fast';
+  if (v >= 45)   return 'normal';
+  if (v >= 20)   return 'slow';
   return 'very slow';
 }
 
@@ -937,6 +980,93 @@ function quickSelect(tableName) {
 // Fetch tables on initial load.
 fetchTables();
 
+// ── Query history autocomplete ──────────────────────────────────────────────
+let serverHistory = [];  // all queries from server, ordered last-used first
+let acIndex = -1;
+
+async function fetchHistory() {
+  try {
+    const res = await fetch('/history');
+    const data = await res.json();
+    serverHistory = data.queries || [];
+    // Seed in-memory history panel (deduplicate against already-shown items)
+    const existing = new Set(queryHistory.map(h => h.sql));
+    for (const sql of serverHistory) {
+      if (!existing.has(sql)) {
+        queryHistory.push({ sql, time: '' });
+        existing.add(sql);
+      }
+    }
+    if (serverHistory.length > 0) renderHistory();
+  } catch (_) {}
+}
+
+function acMatches(val) {
+  if (!val.trim()) return [];
+  const lower = val.toLowerCase();
+  return serverHistory.filter(s => s.toLowerCase().includes(lower)).slice(0, 12);
+}
+
+function renderAC(matches) {
+  const list = document.getElementById('ac-list');
+  if (!matches.length) { list.classList.remove('open'); return; }
+  list.innerHTML = matches.map((s, i) =>
+    `<div class="ac-item" data-i="${i}" onmousedown="pickAC(event,${i})">${esc(s.length > 120 ? s.slice(0,120)+'…' : s)}</div>`
+  ).join('');
+  acIndex = -1;
+  list.classList.add('open');
+}
+
+function closeAC() {
+  document.getElementById('ac-list').classList.remove('open');
+  acIndex = -1;
+}
+
+function pickAC(e, i) {
+  e.preventDefault();
+  const list = document.getElementById('ac-list');
+  const items = list.querySelectorAll('.ac-item');
+  document.getElementById('query').value = serverHistory.filter(s =>
+    s.toLowerCase().includes(document.getElementById('query').value.toLowerCase())
+  ).slice(0,12)[i];
+  closeAC();
+}
+
+const queryTA = document.getElementById('query');
+queryTA.addEventListener('input', () => {
+  renderAC(acMatches(queryTA.value));
+});
+queryTA.addEventListener('keydown', e => {
+  const list = document.getElementById('ac-list');
+  const items = list.querySelectorAll('.ac-item');
+  if (!list.classList.contains('open')) return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    acIndex = Math.min(acIndex + 1, items.length - 1);
+    items.forEach((el, i) => el.classList.toggle('active', i === acIndex));
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    acIndex = Math.max(acIndex - 1, -1);
+    items.forEach((el, i) => el.classList.toggle('active', i === acIndex));
+  } else if (e.key === 'Enter' && acIndex >= 0) {
+    e.preventDefault();
+    items[acIndex].dispatchEvent(new MouseEvent('mousedown'));
+  } else if (e.key === 'Escape') {
+    closeAC();
+  }
+});
+queryTA.addEventListener('blur', () => setTimeout(closeAC, 100));
+
+// After a query runs successfully, add it to serverHistory for immediate autocomplete
+const _origPushHistory = pushHistory;
+pushHistory = function(sql) {
+  _origPushHistory(sql);
+  if (!serverHistory.includes(sql)) serverHistory.unshift(sql);
+  else { serverHistory = [sql, ...serverHistory.filter(s => s !== sql)]; }
+};
+
+fetchHistory();
+
 function formatQuery() {
   const ta = document.getElementById('query');
   const formatted = formatSQL(ta.value);
@@ -1235,7 +1365,7 @@ function startStepPlay() {
   stepPlaying = true;
   document.getElementById('stepPlayBtn').textContent = '⏸ Pause';
   document.getElementById('stepPlayBtn').classList.add('play-active');
-  const ms = Math.max(20, 400 - speed.execStep * 2);
+  const ms = Math.max(20, speed.execStep);
   stepPlayTimer = setInterval(() => {
     if (stepPos >= stepLog.length - 1) { stopStepPlay(); return; }
     stepForward();

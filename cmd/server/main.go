@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 )
 
 //go:embed web
@@ -16,8 +18,15 @@ var webFiles embed.FS
 func main() {
 	db := storage.New()
 
+	historyPath := filepath.Join(filepath.Dir(os.Args[0]), "minidb.history.db")
+	history, err := api.NewHistoryStore(historyPath)
+	if err != nil {
+		log.Printf("history store unavailable: %v", err)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/query", api.QueryHandler(db))
+	mux.HandleFunc("/query", api.QueryHandler(db, history))
+	mux.HandleFunc("/history", api.HistoryHandler(history))
 	mux.HandleFunc("/tables", api.TablesHandler(db))
 	mux.HandleFunc("/seed", api.SeedHandler(db))
 	mux.HandleFunc("/vacuum", api.VacuumHandler(db))

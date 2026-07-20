@@ -36,6 +36,15 @@ cmd/server/
 CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOLEAN);
 DROP TABLE users;
 
+-- Constraints
+-- PRIMARY KEY enforced on INSERT: duplicate or NULL value rejected
+-- FOREIGN KEY enforced on INSERT (child must match parent) and DELETE (parent can't be removed if referenced)
+CREATE TABLE orders (
+  id INT PRIMARY KEY,
+  user_id INT,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
 -- DML
 INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30);
 INSERT INTO users VALUES (2, 'Bob', 24);
@@ -102,6 +111,8 @@ VACUUM players;  -- reclaim dead tuples left by committed DELETEs/UPDATEs
 
 `SelectStatement` fields: `Distinct bool`, `Exprs []SelectExpr` (`ColSelectExpr` | `AggSelectExpr`), `Table`, `Alias`, `Joins []JoinClause`, `Where Expression`, `GroupBy []string`, `Having Expression`, `OrderBy []OrderByExpr`, `Limit *int64`, `Offset *int64`.
 
+`CreateTableStatement` fields: `Table string`, `Columns []ColumnDef`, `ForeignKeys []ForeignKeyConstraint`. `ColumnDef.Primary bool` marks PRIMARY KEY columns. `ForeignKeyConstraint` holds `Column`, `RefTable`, `RefColumn` — parsed from `FOREIGN KEY (col) REFERENCES table(col)`.
+
 Expression nodes: `BinaryExpr`, `IdentExpr`, `LiteralExpr`, `AggFuncExpr`.
 
 ## Executor dispatch
@@ -113,6 +124,11 @@ Expression nodes: `BinaryExpr`, `IdentExpr`, `LiteralExpr`, `AggFuncExpr`.
 ## Storage
 
 All data in-memory — lost on restart. `Row` is `map[string]interface{}`. Aggregate results use synthetic rows with keys like `"COUNT(*)"`, `"SUM(xp)"` for HAVING evaluation.
+
+`Table` struct holds `ForeignKeys []FKConstraint`. Constraint enforcement happens inside `storage.Insert` and `storage.DeleteRows`:
+- **PRIMARY KEY** (INSERT): scans live tuples for duplicate PK value; rejects NULL.
+- **FOREIGN KEY** (INSERT): scans parent table for matching `RefColumn` value; NULL in FK column is allowed.
+- **FOREIGN KEY** (DELETE parent): scans all child tables for references to rows being deleted; rejects if found (RESTRICT).
 
 ## Statistics (Phase 4)
 

@@ -417,9 +417,11 @@ func TablesHandler(db *storage.Database) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
 		type ColInfo struct {
-			Name    string `json:"name"`
-			Type    string `json:"type"`
-			Primary bool   `json:"primary"`
+			Name      string `json:"name"`
+			Type      string `json:"type"`
+			Primary   bool   `json:"primary"`
+			Indexed   bool   `json:"indexed,omitempty"`
+			IndexName string `json:"indexName,omitempty"`
 		}
 		type TblInfo struct {
 			Name     string    `json:"name"`
@@ -429,9 +431,21 @@ func TablesHandler(db *storage.Database) http.HandlerFunc {
 
 		var result []TblInfo
 		for _, t := range db.ListTables() {
+			idxes := db.ListIndexesForTable(t.Name)
+			colIdx := make(map[string]string, len(idxes))
+			for _, idx := range idxes {
+				colIdx[idx.Column] = idx.Name
+			}
 			var cols []ColInfo
 			for _, c := range t.Columns {
-				cols = append(cols, ColInfo{Name: c.Name, Type: string(c.Type), Primary: c.Primary})
+				idxName := colIdx[c.Name]
+				cols = append(cols, ColInfo{
+					Name:      c.Name,
+					Type:      string(c.Type),
+					Primary:   c.Primary,
+					Indexed:   idxName != "",
+					IndexName: idxName,
+				})
 			}
 			result = append(result, TblInfo{Name: t.Name, Columns: cols, RowCount: t.RowCount})
 		}

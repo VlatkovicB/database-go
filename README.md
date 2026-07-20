@@ -29,6 +29,16 @@ Click **⚡ Seed Game DB** in the header to load 10 pre-built game tables (~277 
 CREATE TABLE players (id INT PRIMARY KEY, username TEXT, level INT, class TEXT, xp INT);
 DROP TABLE players;
 
+-- Foreign keys
+CREATE TABLE guilds (id INT PRIMARY KEY, name TEXT);
+CREATE TABLE members (
+  id INT PRIMARY KEY,
+  guild_id INT,
+  FOREIGN KEY (guild_id) REFERENCES guilds(id)
+);
+-- INSERT INTO members ... fails if guild_id has no match in guilds
+-- DELETE FROM guilds ... fails if any members row references that guild
+
 -- Write
 INSERT INTO players (id, username, level, class, xp) VALUES (1, 'Alice', 42, 'Mage', 9200);
 UPDATE players SET level = 43 WHERE id = 1;
@@ -138,6 +148,14 @@ SELECT execution has three paths:
 - Any aggregate or GROUP BY → `execSelectGroupBy`
 
 All three paths finish through `postProcess`: DISTINCT dedup → ORDER BY sort → LIMIT/OFFSET slice.
+
+### Constraints
+
+**PRIMARY KEY** — enforced on INSERT. Duplicate key values are rejected with an error. NULL is also rejected.
+
+**FOREIGN KEY** — declared as a table-level constraint. Two rules are enforced:
+- INSERT into child table: referenced value must exist in the parent table.
+- DELETE from parent table: rejected (RESTRICT) if any child row references the deleted value.
 
 ### MVCC (Phase 5)
 

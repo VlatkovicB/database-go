@@ -76,9 +76,16 @@ type ColumnDef struct {
 	Primary bool
 }
 
+type ForeignKeyConstraint struct {
+	Column    string
+	RefTable  string
+	RefColumn string
+}
+
 type CreateTableStatement struct {
-	Table   string
-	Columns []ColumnDef
+	Table       string
+	Columns     []ColumnDef
+	ForeignKeys []ForeignKeyConstraint
 }
 
 type DropTableStatement struct {

@@ -731,13 +731,30 @@ func (e *Executor) execCreate(s *parser.CreateTableStatement) (*Result, error) {
 	if err := e.db.CreateTable(s.Table, cols); err != nil {
 		return nil, err
 	}
+	if len(s.ForeignKeys) > 0 {
+		var fks []storage.FKConstraint
+		for _, fk := range s.ForeignKeys {
+			fks = append(fks, storage.FKConstraint{
+				Column:    fk.Column,
+				RefTable:  fk.RefTable,
+				RefColumn: fk.RefColumn,
+			})
+		}
+		if err := e.db.SetForeignKeys(s.Table, fks); err != nil {
+			return nil, err
+		}
+	}
+	trace := []string{
+		fmt.Sprintf("Validate %d column definition(s)", len(cols)),
+		fmt.Sprintf("Register %q in database catalog", s.Table),
+		"Initialize empty row storage",
+	}
+	if len(s.ForeignKeys) > 0 {
+		trace = append(trace, fmt.Sprintf("Register %d foreign key constraint(s)", len(s.ForeignKeys)))
+	}
 	return &Result{
 		Message: fmt.Sprintf("table %q created", s.Table),
-		Trace: []string{
-			fmt.Sprintf("Validate %d column definition(s)", len(cols)),
-			fmt.Sprintf("Register %q in database catalog", s.Table),
-			"Initialize empty row storage",
-		},
+		Trace:   trace,
 	}, nil
 }
 

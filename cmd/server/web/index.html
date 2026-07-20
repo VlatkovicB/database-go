@@ -71,6 +71,7 @@
   .col-pk { color: #ffa657; font-size: 10px; }
   .col-name { color: #8b949e; flex: 1; }
   .col-type { color: #388bfd; font-size: 11px; }
+  .col-idx { color: #3fb950; font-size: 9px; font-weight: 700; letter-spacing: .5px; background: #1a2d1e; border: 1px solid #3fb95055; border-radius: 3px; padding: 0 3px; }
 
   /* Main */
   .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -984,6 +985,7 @@ function renderTables(tables) {
         <span class="col-pk">${c.primary ? '🔑' : '·'}</span>
         <span class="col-name">${esc(c.name)}</span>
         <span class="col-type">${esc(c.type)}</span>
+        ${c.indexed ? `<span class="col-idx" title="${esc(c.indexName)}">IDX</span>` : ''}
       </div>`).join('');
     return `
       <div class="tbl-group">

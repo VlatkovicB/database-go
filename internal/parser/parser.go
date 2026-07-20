@@ -466,11 +466,19 @@ func (p *Parser) parseCreate() (Statement, error) {
 		return nil, fmt.Errorf("CREATE TABLE: expected (")
 	}
 	for !p.is(lexer.RPAREN) && !p.is(lexer.EOF) {
-		col, err := p.parseColumnDef()
-		if err != nil {
-			return nil, err
+		if p.is(lexer.FOREIGN) {
+			fk, err := p.parseForeignKeyConstraint()
+			if err != nil {
+				return nil, err
+			}
+			stmt.ForeignKeys = append(stmt.ForeignKeys, fk)
+		} else {
+			col, err := p.parseColumnDef()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Columns = append(stmt.Columns, col)
 		}
-		stmt.Columns = append(stmt.Columns, col)
 		if p.is(lexer.COMMA) {
 			p.advance()
 		}
@@ -521,6 +529,41 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		col.Primary = true
 	}
 	return col, nil
+}
+
+func (p *Parser) parseForeignKeyConstraint() (ForeignKeyConstraint, error) {
+	p.advance() // consume FOREIGN
+	if _, err := p.expect(lexer.KEY); err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected KEY after FOREIGN")
+	}
+	if _, err := p.expect(lexer.LPAREN); err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected (")
+	}
+	col, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected column name")
+	}
+	if _, err := p.expect(lexer.RPAREN); err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected )")
+	}
+	if _, err := p.expect(lexer.REFERENCES); err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected REFERENCES")
+	}
+	refTable, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected referenced table name")
+	}
+	if _, err := p.expect(lexer.LPAREN); err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected (")
+	}
+	refCol, err := p.expect(lexer.IDENT)
+	if err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected referenced column name")
+	}
+	if _, err := p.expect(lexer.RPAREN); err != nil {
+		return ForeignKeyConstraint{}, fmt.Errorf("foreign key: expected )")
+	}
+	return ForeignKeyConstraint{Column: col.Literal, RefTable: refTable.Literal, RefColumn: refCol.Literal}, nil
 }
 
 func (p *Parser) parseDrop() (Statement, error) {

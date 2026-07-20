@@ -21,6 +21,12 @@ type Column struct {
 	Primary bool
 }
 
+type FKConstraint struct {
+	Column    string
+	RefTable  string
+	RefColumn string
+}
+
 // Row is a single record — column name to value.
 // Values are int64, float64, string, bool, or nil.
 type Row map[string]interface{}
@@ -40,6 +46,7 @@ type IndexInfo struct {
 type Table struct {
 	Name          string
 	Columns       []Column
+	ForeignKeys   []FKConstraint
 	Pages         []Page
 	tuplesPerPage int
 	Indexes       map[string]*Index
@@ -94,6 +101,17 @@ func (db *Database) GetTable(name string) (*Table, error) {
 	return t, nil
 }
 
+func (db *Database) SetForeignKeys(tableName string, fks []FKConstraint) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		return fmt.Errorf("table %q does not exist", tableName)
+	}
+	t.ForeignKeys = fks
+	return nil
+}
+
 // Insert appends a new tuple to the table. xid is the inserting transaction ID
 // (0 means auto-committed / pre-MVCC — always visible to all transactions).
 func (db *Database) Insert(tableName string, row Row, xid uint64) error {
@@ -103,6 +121,58 @@ func (db *Database) Insert(tableName string, row Row, xid uint64) error {
 	if !ok {
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
+
+	// Check PRIMARY KEY uniqueness
+	for _, col := range t.Columns {
+		if !col.Primary {
+			continue
+		}
+		pkVal, hasPK := row[col.Name]
+		if !hasPK || pkVal == nil {
+			return fmt.Errorf("null value in column %q violates not-null constraint", col.Name)
+		}
+		for _, pg := range t.Pages {
+			for _, tpl := range pg.Tuples {
+				if tpl.Xmax != 0 {
+					continue
+				}
+				if tpl.Data[col.Name] == pkVal {
+					return fmt.Errorf("duplicate key value violates unique constraint on %q: %q=%v already exists", tableName, col.Name, pkVal)
+				}
+			}
+		}
+	}
+
+	// Check FOREIGN KEY constraints
+	for _, fk := range t.ForeignKeys {
+		val := row[fk.Column]
+		if val == nil {
+			continue // NULL is allowed
+		}
+		refT, ok := db.Tables[fk.RefTable]
+		if !ok {
+			return fmt.Errorf("foreign key references unknown table %q", fk.RefTable)
+		}
+		found := false
+		for _, pg := range refT.Pages {
+			for _, tpl := range pg.Tuples {
+				if tpl.Xmax != 0 {
+					continue
+				}
+				if tpl.Data[fk.RefColumn] == val {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("insert violates foreign key constraint: %q.%q=%v has no match in %q.%q", tableName, fk.Column, val, fk.RefTable, fk.RefColumn)
+		}
+	}
+
 	var inserted Tuple
 	if len(t.Pages) > 0 {
 		last := &t.Pages[len(t.Pages)-1]
@@ -474,6 +544,34 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 	if !ok {
 		return 0, fmt.Errorf("table %q does not exist", tableName)
 	}
+
+	// Check FK: no child table may reference rows we're about to delete
+	for childName, child := range db.Tables {
+		for _, fk := range child.ForeignKeys {
+			if fk.RefTable != tableName {
+				continue
+			}
+			for _, pg := range t.Pages {
+				for _, tpl := range pg.Tuples {
+					if tpl.Xmax != 0 || !predicate(tpl.Data) {
+						continue
+					}
+					val := tpl.Data[fk.RefColumn]
+					for _, cpg := range child.Pages {
+						for _, ctpl := range cpg.Tuples {
+							if ctpl.Xmax != 0 {
+								continue
+							}
+							if ctpl.Data[fk.Column] == val {
+								return 0, fmt.Errorf("delete violates foreign key constraint: %q.%q=%v is referenced by %q.%q", tableName, fk.RefColumn, val, childName, fk.Column)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	deleted := 0
 
 	if xid != 0 {

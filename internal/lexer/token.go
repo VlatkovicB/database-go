@@ -79,6 +79,10 @@ const (
 	// Vacuum keyword
 	VACUUM
 
+	// Constraint keywords
+	FOREIGN
+	REFERENCES
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -143,7 +147,9 @@ var keywords = map[string]TokenType{
 	"BEGIN":    BEGIN,
 	"COMMIT":   COMMIT,
 	"ROLLBACK": ROLLBACK,
-	"VACUUM":   VACUUM,
+	"VACUUM":      VACUUM,
+	"FOREIGN":     FOREIGN,
+	"REFERENCES":  REFERENCES,
 }
 
 type Token struct {
@@ -168,6 +174,7 @@ var tokenNames = map[TokenType]string{
 	INDEX: "INDEX", USING: "USING",
 	BEGIN: "BEGIN", COMMIT: "COMMIT", ROLLBACK: "ROLLBACK",
 	VACUUM: "VACUUM",
+	FOREIGN: "FOREIGN", REFERENCES: "REFERENCES",
 	ASTERISK: "*", COMMA: ",", SEMICOLON: ";", LPAREN: "(", RPAREN: ")",
 	DOT: ".", EQ: "=", NEQ: "!=", LT: "<", GT: ">", LTE: "<=", GTE: ">=",
 }
@@ -188,7 +195,8 @@ func (t TokenType) Category() string {
 		EXPLAIN, ANALYZE,
 		INDEX, USING,
 		BEGIN, COMMIT, ROLLBACK,
-		VACUUM:
+		VACUUM,
+		FOREIGN, REFERENCES:
 		return "keyword"
 	case INT, TEXT, BOOLEAN, FLOAT, PRIMARY, KEY:
 		return "type"

@@ -3,6 +3,7 @@ package executor
 import (
 	"database/internal/parser"
 	"database/internal/storage"
+	"errors"
 	"fmt"
 )
 
@@ -66,6 +67,26 @@ func (e *Executor) currentSnapshot() *storage.Snapshot {
 }
 
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
+	result, err := e.executeInner(stmt)
+	if errors.Is(err, storage.ErrDeadlock) {
+		e.handleDeadlock()
+		return nil, fmt.Errorf("ERROR: deadlock detected — transaction rolled back automatically")
+	}
+	return result, err
+}
+
+func (e *Executor) handleDeadlock() {
+	if e.CurrentTx == nil {
+		return
+	}
+	xid := e.CurrentTx.ID
+	e.db.TxManager.Abort(xid)
+	e.db.LockMgr.ReleaseAll(xid)
+	e.db.WAL.Append(xid, storage.WALRollback, "", nil, nil)
+	e.CurrentTx = nil
+}
+
+func (e *Executor) executeInner(stmt parser.Statement) (*Result, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStatement:
 		return e.execSelect(s)

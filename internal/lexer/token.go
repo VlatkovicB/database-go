@@ -87,6 +87,10 @@ const (
 	WITH
 	IN
 
+	// Locking keywords
+	FOR
+	SHARE
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -156,6 +160,8 @@ var keywords = map[string]TokenType{
 	"REFERENCES":  REFERENCES,
 	"WITH":        WITH,
 	"IN":          IN,
+	"FOR":         FOR,
+	"SHARE":       SHARE,
 }
 
 type Token struct {
@@ -182,6 +188,7 @@ var tokenNames = map[TokenType]string{
 	VACUUM: "VACUUM",
 	FOREIGN: "FOREIGN", REFERENCES: "REFERENCES",
 	WITH: "WITH", IN: "IN",
+	FOR: "FOR", SHARE: "SHARE",
 	ASTERISK: "*", COMMA: ",", SEMICOLON: ";", LPAREN: "(", RPAREN: ")",
 	DOT: ".", EQ: "=", NEQ: "!=", LT: "<", GT: ">", LTE: "<=", GTE: ">=",
 }
@@ -204,7 +211,8 @@ func (t TokenType) Category() string {
 		BEGIN, COMMIT, ROLLBACK,
 		VACUUM,
 		FOREIGN, REFERENCES,
-		WITH, IN:
+		WITH, IN,
+		FOR, SHARE:
 		return "keyword"
 	case INT, TEXT, BOOLEAN, FLOAT, PRIMARY, KEY:
 		return "type"

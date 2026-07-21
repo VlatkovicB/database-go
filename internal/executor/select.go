@@ -276,7 +276,14 @@ func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[stri
 	}
 	physRel := p.planRelations(refs, singleWhere)
 
-	root := physRelToVolcano(physRel, e.db, snap, xid, logger, ctes)
+	lockMode := storage.NoLock
+	if sel.ForLock == "FOR UPDATE" {
+		lockMode = storage.ExclusiveLock
+	} else if sel.ForLock == "FOR SHARE" {
+		lockMode = storage.ShareLock
+	}
+
+	root := physRelToVolcano(physRel, e.db, snap, xid, logger, ctes, lockMode, e.db.LockMgr)
 
 	// Apply WHERE filter:
 	// - Multi-table or subquery-in-WHERE: add filter above join/scan with subquery ctx

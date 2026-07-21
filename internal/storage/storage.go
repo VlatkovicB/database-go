@@ -58,6 +58,8 @@ type Database struct {
 	Tables    map[string]*Table
 	TxManager *TxManager
 	WAL       *WALManager
+	LockMgr   *LockManager
+	BPM       *BufferPool
 }
 
 func New() *Database {
@@ -65,6 +67,8 @@ func New() *Database {
 		Tables:    make(map[string]*Table),
 		TxManager: NewTxManager(),
 		WAL:       NewWALManager(),
+		LockMgr:   NewLockManager(),
+		BPM:       NewBufferPool(DefaultBufPoolSize),
 	}
 }
 
@@ -142,6 +146,7 @@ func (db *Database) Insert(tableName string, row Row, xid uint64) error {
 			inserted = Tuple{PageNum: pageNum, SlotNum: slotNum, Data: row, Xmin: xid}
 			last.Tuples = append(last.Tuples, inserted)
 			t.updateIndexes(inserted)
+			db.BPM.InvalidatePage(PageID{Table: tableName, PageNum: inserted.PageNum})
 			return nil
 		}
 	}
@@ -150,6 +155,7 @@ func (db *Database) Insert(tableName string, row Row, xid uint64) error {
 	pg := Page{Tuples: []Tuple{inserted}}
 	t.Pages = append(t.Pages, pg)
 	t.updateIndexes(inserted)
+	db.BPM.InvalidatePage(PageID{Table: tableName, PageNum: inserted.PageNum})
 	return nil
 }
 
@@ -233,23 +239,33 @@ func (db *Database) tupleVisible(tuple Tuple, snap *Snapshot, xid uint64) bool {
 	return Visible(tuple.Xmin, tuple.Xmax, *snap, xid, db.TxManager)
 }
 
-// ScanPages returns visible tuples with physical locations, plus total page count.
+// ScanPages returns visible tuples with physical locations, plus total page count and buffer stats.
 // snap==nil means auto-commit mode (same visibility rules as Scan).
-func (db *Database) ScanPages(tableName string, snap *Snapshot, xid uint64) ([]Tuple, []Column, int, error) {
+func (db *Database) ScanPages(tableName string, snap *Snapshot, xid uint64) ([]Tuple, []Column, int, BPStats, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	t, ok := db.Tables[tableName]
 	if !ok {
-		return nil, nil, 0, fmt.Errorf("table %q does not exist", tableName)
+		return nil, nil, 0, BPStats{}, fmt.Errorf("table %q does not exist", tableName)
 	}
 	var tuples []Tuple
-	t.ScanTuples(func(tuple Tuple) bool {
-		if db.tupleVisible(tuple, snap, xid) {
-			tuples = append(tuples, tuple)
+	var stats BPStats
+	for i := range t.Pages {
+		id := PageID{Table: tableName, PageNum: i}
+		slot, hit := db.BPM.FetchPage(id)
+		if hit {
+			stats.Hits++
+		} else {
+			stats.Misses++
 		}
-		return true
-	})
-	return tuples, t.Columns, len(t.Pages), nil
+		for _, tpl := range t.Pages[i].Tuples {
+			if db.tupleVisible(tpl, snap, xid) {
+				tuples = append(tuples, tpl)
+			}
+		}
+		db.BPM.Unpin(slot, false)
+	}
+	return tuples, t.Columns, len(t.Pages), stats, nil
 }
 
 func (db *Database) RowCount(tableName string) (int, error) {
@@ -281,42 +297,104 @@ func (db *Database) PageCount(tableName string) (int, error) {
 // xid==0 falls back to in-place mutation for auto-commit mode.
 // Returns (count, oldRows, newRows, error) for WAL logging by the caller.
 func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, update func(Row) Row, xid uint64) (int, []Row, []Row, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	// Auto-commit path: no row-level locking needed
+	if xid == 0 {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		t, ok := db.Tables[tableName]
+		if !ok {
+			return 0, nil, nil, fmt.Errorf("table %q does not exist", tableName)
+		}
+		count := 0
+		var oldRows []Row
+		var newRows []Row
+		for i := range t.Pages {
+			for j := range t.Pages[i].Tuples {
+				tpl := &t.Pages[i].Tuples[j]
+				if tpl.Xmax != 0 {
+					continue
+				}
+				if !predicate(tpl.Data) {
+					continue
+				}
+				oldCopy := make(Row, len(tpl.Data))
+				for k, v := range tpl.Data {
+					oldCopy[k] = v
+				}
+				tpl.Data = update(tpl.Data)
+				oldRows = append(oldRows, oldCopy)
+				newRows = append(newRows, tpl.Data)
+				count++
+			}
+		}
+		t.rebuildIndexes()
+		// For auto-commit, newRows == oldRows (in-place), return the updated rows
+		newRows = oldRows
+		return count, oldRows, newRows, nil
+	}
+
+	// MVCC path: scan → acquire row locks → write
+	// Step 1: scan to find candidate tuples (RLock)
+	db.mu.RLock()
 	t, ok := db.Tables[tableName]
 	if !ok {
+		db.mu.RUnlock()
 		return 0, nil, nil, fmt.Errorf("table %q does not exist", tableName)
 	}
-	count := 0
-	var oldRows []Row
-	var newRows []Row
-	for i := range t.Pages {
-		for j := range t.Pages[i].Tuples {
-			tpl := &t.Pages[i].Tuples[j]
+	type candidate struct {
+		pageNum int
+		slotNum int
+		data    Row
+	}
+	var candidates []candidate
+	for i, pg := range t.Pages {
+		for j, tpl := range pg.Tuples {
 			if tpl.Xmax != 0 {
-				continue // already dead
-			}
-			if !predicate(tpl.Data) {
 				continue
 			}
-			oldCopy := make(Row, len(tpl.Data))
-			for k, v := range tpl.Data {
-				oldCopy[k] = v
+			if predicate(tpl.Data) {
+				candidates = append(candidates, candidate{i, j, tpl.Data})
 			}
-			newRow := update(tpl.Data)
-			if xid == 0 {
-				// Auto-commit: mutate in place (legacy behaviour)
-				tpl.Data = newRow
-			} else {
-				// MVCC: stamp old tuple as deleted, queue new version
-				tpl.Xmax = xid
-				newRows = append(newRows, newRow)
-			}
-			oldRows = append(oldRows, oldCopy)
-			count++
 		}
 	}
-	// Append new tuple versions for MVCC updates
+	db.mu.RUnlock()
+
+	// Step 2: acquire ExclusiveLock on each candidate row (may block)
+	var locked []RowLockID
+	for _, c := range candidates {
+		rowID := RowLockID{Table: tableName, PageNum: c.pageNum, SlotNum: c.slotNum}
+		if err := db.LockMgr.Acquire(xid, rowID, ExclusiveLock); err != nil {
+			for _, r := range locked {
+				db.LockMgr.Release(xid, r)
+			}
+			return 0, nil, nil, err
+		}
+		locked = append(locked, rowID)
+	}
+
+	// Step 3: write under full lock
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	t = db.Tables[tableName]
+	count := 0
+	var oldRows, newRows []Row
+	for _, c := range candidates {
+		tpl := &t.Pages[c.pageNum].Tuples[c.slotNum]
+		if tpl.Xmax != 0 {
+			continue // first-updater-wins: another tx beat us
+		}
+		oldCopy := make(Row, len(tpl.Data))
+		for k, v := range tpl.Data {
+			oldCopy[k] = v
+		}
+		newRow := update(tpl.Data)
+		tpl.Xmax = xid
+		newRows = append(newRows, newRow)
+		oldRows = append(oldRows, oldCopy)
+		count++
+		db.BPM.InvalidatePage(PageID{Table: tableName, PageNum: c.pageNum})
+	}
+	// Append new tuple versions
 	for _, row := range newRows {
 		if len(t.Pages) > 0 {
 			last := &t.Pages[len(t.Pages)-1]
@@ -324,18 +402,16 @@ func (db *Database) UpdateRows(tableName string, predicate func(Row) bool, updat
 				slotNum := len(last.Tuples)
 				pageNum := len(t.Pages) - 1
 				last.Tuples = append(last.Tuples, Tuple{PageNum: pageNum, SlotNum: slotNum, Data: row, Xmin: xid})
+				db.BPM.InvalidatePage(PageID{Table: tableName, PageNum: pageNum})
 				continue
 			}
 		}
 		pageNum := len(t.Pages)
 		pg := Page{Tuples: []Tuple{{PageNum: pageNum, SlotNum: 0, Data: row, Xmin: xid}}}
 		t.Pages = append(t.Pages, pg)
+		db.BPM.InvalidatePage(PageID{Table: tableName, PageNum: pageNum})
 	}
 	t.rebuildIndexes()
-	if xid == 0 {
-		// For auto-commit, newRows == oldRows (in-place), return the updated rows
-		newRows = oldRows
-	}
 	return count, oldRows, newRows, nil
 }
 
@@ -518,75 +594,116 @@ func (db *Database) GetTableStats(name string) *TableStats {
 // When xid==0 (auto-commit), physically removes rows (legacy behaviour).
 // Returns (count, deletedRows, error) for WAL logging by the caller.
 func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid uint64) (int, []Row, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	t, ok := db.Tables[tableName]
-	if !ok {
-		return 0, nil, fmt.Errorf("table %q does not exist", tableName)
-	}
-
-	if err := checkFKRestrict(t, predicate, db.Tables); err != nil {
-		return 0, nil, err
-	}
-
-	deleted := 0
-	var deletedRows []Row
-
-	if xid != 0 {
-		// MVCC: mark matching live tuples as deleted
-		for i := range t.Pages {
-			for j := range t.Pages[i].Tuples {
-				tpl := &t.Pages[i].Tuples[j]
-				if tpl.Xmax != 0 {
-					continue // already dead
+	// Auto-commit path
+	if xid == 0 {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		t, ok := db.Tables[tableName]
+		if !ok {
+			return 0, nil, fmt.Errorf("table %q does not exist", tableName)
+		}
+		if err := checkFKRestrict(t, predicate, db.Tables); err != nil {
+			return 0, nil, err
+		}
+		deleted := 0
+		var deletedRows []Row
+		var kept []Row
+		for _, pg := range t.Pages {
+			for _, tuple := range pg.Tuples {
+				if tuple.Xmax != 0 {
+					continue
 				}
-				if predicate(tpl.Data) {
-					rowCopy := make(Row, len(tpl.Data))
-					for k, v := range tpl.Data {
+				if predicate(tuple.Data) {
+					rowCopy := make(Row, len(tuple.Data))
+					for k, v := range tuple.Data {
 						rowCopy[k] = v
 					}
 					deletedRows = append(deletedRows, rowCopy)
-					tpl.Xmax = xid
 					deleted++
+				} else {
+					kept = append(kept, tuple.Data)
 				}
 			}
+		}
+		t.Pages = nil
+		for pageNum := 0; len(kept) > 0; pageNum++ {
+			end := t.tuplesPerPage
+			if end > len(kept) {
+				end = len(kept)
+			}
+			pg := Page{}
+			for i, row := range kept[:end] {
+				pg.Tuples = append(pg.Tuples, Tuple{PageNum: pageNum, SlotNum: i, Data: row})
+			}
+			t.Pages = append(t.Pages, pg)
+			kept = kept[end:]
 		}
 		t.rebuildIndexes()
 		return deleted, deletedRows, nil
 	}
 
-	// Auto-commit (xid==0): physical removal for backward compat
-	var kept []Row
-	for _, pg := range t.Pages {
-		for _, tuple := range pg.Tuples {
-			if tuple.Xmax != 0 {
-				continue // skip already-dead tuples
+	// MVCC path: scan → lock → mark dead
+	// Step 1: scan (RLock)
+	db.mu.RLock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		db.mu.RUnlock()
+		return 0, nil, fmt.Errorf("table %q does not exist", tableName)
+	}
+	if err := checkFKRestrict(t, predicate, db.Tables); err != nil {
+		db.mu.RUnlock()
+		return 0, nil, err
+	}
+	type candidate struct {
+		pageNum int
+		slotNum int
+		data    Row
+	}
+	var candidates []candidate
+	for i, pg := range t.Pages {
+		for j, tpl := range pg.Tuples {
+			if tpl.Xmax != 0 {
+				continue
 			}
-			if predicate(tuple.Data) {
-				rowCopy := make(Row, len(tuple.Data))
-				for k, v := range tuple.Data {
-					rowCopy[k] = v
-				}
-				deletedRows = append(deletedRows, rowCopy)
-				deleted++
-			} else {
-				kept = append(kept, tuple.Data)
+			if predicate(tpl.Data) {
+				candidates = append(candidates, candidate{i, j, tpl.Data})
 			}
 		}
 	}
-	// Rebuild pages from kept rows.
-	t.Pages = nil
-	for pageNum := 0; len(kept) > 0; pageNum++ {
-		end := t.tuplesPerPage
-		if end > len(kept) {
-			end = len(kept)
+	db.mu.RUnlock()
+
+	// Step 2: acquire ExclusiveLocks
+	var locked []RowLockID
+	for _, c := range candidates {
+		rowID := RowLockID{Table: tableName, PageNum: c.pageNum, SlotNum: c.slotNum}
+		if err := db.LockMgr.Acquire(xid, rowID, ExclusiveLock); err != nil {
+			for _, r := range locked {
+				db.LockMgr.Release(xid, r)
+			}
+			return 0, nil, err
 		}
-		pg := Page{}
-		for i, row := range kept[:end] {
-			pg.Tuples = append(pg.Tuples, Tuple{PageNum: pageNum, SlotNum: i, Data: row})
+		locked = append(locked, rowID)
+	}
+
+	// Step 3: mark dead (Lock)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	t = db.Tables[tableName]
+	deleted := 0
+	var deletedRows []Row
+	for _, c := range candidates {
+		tpl := &t.Pages[c.pageNum].Tuples[c.slotNum]
+		if tpl.Xmax != 0 {
+			continue
 		}
-		t.Pages = append(t.Pages, pg)
-		kept = kept[end:]
+		rowCopy := make(Row, len(tpl.Data))
+		for k, v := range tpl.Data {
+			rowCopy[k] = v
+		}
+		deletedRows = append(deletedRows, rowCopy)
+		tpl.Xmax = xid
+		deleted++
+		db.BPM.InvalidatePage(PageID{Table: tableName, PageNum: c.pageNum})
 	}
 	t.rebuildIndexes()
 	return deleted, deletedRows, nil

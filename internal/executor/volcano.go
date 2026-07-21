@@ -24,6 +24,8 @@ type Node interface {
 // BufferReporter is implemented by scan nodes that track pages read.
 type BufferReporter interface {
 	BuffersRead() int
+	BufferHits() int
+	BufferMisses() int
 	ScanTable() string
 }
 
@@ -93,27 +95,32 @@ type loggable interface {
 
 type seqScan struct {
 	nodeBase
-	db          *storage.Database
-	table       string
-	alias       string
-	snap        *storage.Snapshot
-	xid         uint64
-	tuples      []storage.Tuple
-	pos         int
-	buffersRead int
+	db        *storage.Database
+	table     string
+	alias     string
+	snap      *storage.Snapshot
+	xid       uint64
+	lockMode  storage.LockMode
+	lockMgr   *storage.LockManager
+	tuples    []storage.Tuple
+	pos       int
+	bufHits   int
+	bufMisses int
 }
 
-func newSeqScan(db *storage.Database, table, alias string, snap *storage.Snapshot, xid uint64) *seqScan {
-	return &seqScan{db: db, table: table, alias: alias, snap: snap, xid: xid}
+func newSeqScan(db *storage.Database, table, alias string, snap *storage.Snapshot, xid uint64, lockMode storage.LockMode, lockMgr *storage.LockManager) *seqScan {
+	return &seqScan{db: db, table: table, alias: alias, snap: snap, xid: xid, lockMode: lockMode, lockMgr: lockMgr}
 }
 
 func (n *seqScan) NodeName() string     { return "Seq Scan on " + n.table }
 func (n *seqScan) NodeChildren() []Node { return nil }
-func (n *seqScan) BuffersRead() int     { return n.buffersRead }
+func (n *seqScan) BuffersRead() int     { return n.bufHits + n.bufMisses }
+func (n *seqScan) BufferHits() int      { return n.bufHits }
+func (n *seqScan) BufferMisses() int    { return n.bufMisses }
 func (n *seqScan) ScanTable() string    { return n.table }
 
 func (n *seqScan) Open() error {
-	tuples, _, pageCount, err := n.db.ScanPages(n.table, n.snap, n.xid)
+	tuples, _, pageCount, bpStats, err := n.db.ScanPages(n.table, n.snap, n.xid)
 	if err != nil {
 		return err
 	}
@@ -127,8 +134,20 @@ func (n *seqScan) Open() error {
 		row[pfx+"ctid"] = t.CTID()
 		n.tuples[i] = storage.Tuple{PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row, Xmin: t.Xmin, Xmax: t.Xmax}
 	}
-	n.buffersRead = pageCount
+	n.bufHits = int(bpStats.Hits)
+	n.bufMisses = int(bpStats.Misses)
+	_ = pageCount // kept for reference; total = bufHits + bufMisses
 	n.pos = 0
+
+	// SELECT FOR UPDATE / FOR SHARE: acquire row locks on all visible tuples
+	if n.lockMode != storage.NoLock && n.lockMgr != nil && n.xid != 0 {
+		for _, t := range tuples {
+			rowID := storage.RowLockID{Table: n.table, PageNum: t.PageNum, SlotNum: t.SlotNum}
+			if err := n.lockMgr.Acquire(n.xid, rowID, n.lockMode); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -189,6 +208,8 @@ func (n *indexScan) NodeName() string {
 }
 func (n *indexScan) NodeChildren() []Node { return nil }
 func (n *indexScan) BuffersRead() int     { return n.buffersRead }
+func (n *indexScan) BufferHits() int      { return 0 } // index pages not tracked via BPM
+func (n *indexScan) BufferMisses() int    { return n.buffersRead }
 func (n *indexScan) ScanTable() string    { return n.table }
 
 func (n *indexScan) Open() error {

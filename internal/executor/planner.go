@@ -277,7 +277,7 @@ func buildTableRefs(sel *parser.SelectStatement) []tableRef {
 }
 
 // physRelToVolcano converts a physRelation tree into a live volcano node tree.
-func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Snapshot, xid uint64, logger *ExecLogger, ctes map[string]*cteEntry) Node {
+func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Snapshot, xid uint64, logger *ExecLogger, ctes map[string]*cteEntry, lockMode storage.LockMode, lockMgr *storage.LockManager) Node {
 	assign := func(n Node) Node {
 		if l, ok := n.(loggable); ok {
 			l.setLog(logger, logger.NextID())
@@ -301,7 +301,7 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 			ip := rel.idxPlan
 			n = assign(newIndexScan(db, rel.table, rel.alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp, snap, xid))
 		} else {
-			n = assign(newSeqScan(db, rel.table, rel.alias, snap, xid))
+			n = assign(newSeqScan(db, rel.table, rel.alias, snap, xid, lockMode, lockMgr))
 		}
 		if rel.filter != nil {
 			n = assign(newFilterNode(n, rel.filter))
@@ -309,8 +309,8 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 		return n
 	}
 
-	left := physRelToVolcano(rel.left, db, snap, xid, logger, ctes)
-	right := physRelToVolcano(rel.right, db, snap, xid, logger, ctes)
+	left := physRelToVolcano(rel.left, db, snap, xid, logger, ctes, lockMode, lockMgr)
+	right := physRelToVolcano(rel.right, db, snap, xid, logger, ctes, lockMode, lockMgr)
 
 	// Provide the right side's alias for hash key extraction (only valid when
 	// the right side is itself a leaf scan, not a compound join).

@@ -6,6 +6,7 @@ package executor
 
 import (
 	"database/internal/parser"
+	"database/internal/storage"
 	"fmt"
 	"math"
 	"strings"
@@ -218,32 +219,39 @@ func planToResult(lines []string) *Result {
 	return &Result{Columns: cols, Rows: rows, Trace: lines}
 }
 
-// collectBuffers walks a volcano tree and returns buffers read per table name.
-func collectBuffers(node Node) map[string]int {
-	result := map[string]int{}
+// collectBuffers walks a volcano tree and returns buffer stats per table name.
+func collectBuffers(node Node) map[string]storage.BPStats {
+	result := map[string]storage.BPStats{}
 	if node == nil {
 		return result
 	}
 	if br, ok := node.(BufferReporter); ok {
-		result[br.ScanTable()] += br.BuffersRead()
+		tbl := br.ScanTable()
+		s := result[tbl]
+		s.Hits += int64(br.BufferHits())
+		s.Misses += int64(br.BufferMisses())
+		result[tbl] = s
 	}
 	for _, child := range node.NodeChildren() {
 		for k, v := range collectBuffers(child) {
-			result[k] += v
+			s := result[k]
+			result[k] = s.Add(v)
 		}
 	}
 	return result
 }
 
 // injectBuffers walks the planNode tree and adds buffer stats to matching scan nodes.
-func injectBuffers(node *planNode, buffers map[string]int) {
+func injectBuffers(node *planNode, buffers map[string]storage.BPStats) {
 	if node == nil {
 		return
 	}
-	for tableName, count := range buffers {
+	for tableName, stats := range buffers {
 		if strings.HasPrefix(node.label, "Seq Scan on "+tableName) ||
 			strings.HasSuffix(node.label, " on "+tableName) {
-			node.extras = append(node.extras, fmt.Sprintf("Buffers: shared read=%d", count))
+			if line := stats.FormatExplain(); line != "" {
+				node.extras = append(node.extras, line)
+			}
 		}
 	}
 	for _, child := range node.children {

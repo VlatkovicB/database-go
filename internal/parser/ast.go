@@ -65,6 +65,7 @@ type SelectStatement struct {
 	OrderBy  []OrderByExpr
 	Limit    *int64
 	Offset   *int64
+	ForLock  string // "FOR UPDATE", "FOR SHARE", or ""
 }
 
 type InsertStatement struct {

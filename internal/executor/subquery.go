@@ -100,7 +100,7 @@ func (e *Executor) materializeAggSubquery(q *parser.SelectStatement, ctx *EvalCt
 			}
 		}
 	} else {
-		scan := newSeqScan(e.db, q.Table, alias, snap, xid)
+		scan := newSeqScan(e.db, q.Table, alias, snap, xid, storage.NoLock, nil)
 		if err := scan.Open(); err != nil {
 			return nil, err
 		}
@@ -198,7 +198,7 @@ func (e *Executor) materializeSubquerySimple(q *parser.SelectStatement, ctx *Eva
 	}
 
 	// Regular table scan.
-	scan := newSeqScan(e.db, q.Table, alias, snap, xid)
+	scan := newSeqScan(e.db, q.Table, alias, snap, xid, storage.NoLock, nil)
 	if err := scan.Open(); err != nil {
 		return nil, err
 	}

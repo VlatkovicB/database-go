@@ -269,6 +269,21 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 		return nil, err
 	}
 
+	// FOR UPDATE / FOR SHARE locking clause
+	if p.is(lexer.FOR) {
+		p.advance() // consume FOR
+		switch {
+		case p.is(lexer.UPDATE):
+			stmt.ForLock = "FOR UPDATE"
+			p.advance()
+		case p.is(lexer.SHARE):
+			stmt.ForLock = "FOR SHARE"
+			p.advance()
+		default:
+			return nil, fmt.Errorf("SELECT: expected UPDATE or SHARE after FOR")
+		}
+	}
+
 	return stmt, nil
 }
 

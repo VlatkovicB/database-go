@@ -36,6 +36,8 @@ func (e *Executor) execCommit() (*Result, error) {
 	if err := e.db.TxManager.Commit(xid); err != nil {
 		return nil, err
 	}
+	lockCount := e.db.LockMgr.HeldCount(xid)
+	e.db.LockMgr.ReleaseAll(xid)
 	e.db.WAL.Append(xid, storage.WALCommit, "", nil, nil)
 	e.CurrentTx = nil
 	return &Result{
@@ -43,6 +45,7 @@ func (e *Executor) execCommit() (*Result, error) {
 		Trace: []string{
 			fmt.Sprintf("xid=%d marked COMMITTED", xid),
 			"Tuple versions written by this tx are now visible to other transactions",
+			fmt.Sprintf("Released %d row lock(s)", lockCount),
 		},
 	}, nil
 }
@@ -55,6 +58,8 @@ func (e *Executor) execRollback() (*Result, error) {
 	if err := e.db.TxManager.Abort(xid); err != nil {
 		return nil, err
 	}
+	lockCount := e.db.LockMgr.HeldCount(xid)
+	e.db.LockMgr.ReleaseAll(xid)
 	e.db.WAL.Append(xid, storage.WALRollback, "", nil, nil)
 	e.CurrentTx = nil
 	return &Result{
@@ -63,6 +68,7 @@ func (e *Executor) execRollback() (*Result, error) {
 			fmt.Sprintf("xid=%d marked ABORTED", xid),
 			"Tuple versions written by this tx are invisible (xmin not committed)",
 			"Dead tuples will be reclaimed by VACUUM",
+			fmt.Sprintf("Released %d row lock(s)", lockCount),
 		},
 	}, nil
 }

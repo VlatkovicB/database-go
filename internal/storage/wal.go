@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -229,7 +230,9 @@ func (w *WALManager) Replay(db *Database) (int, error) {
 				for k, v := range row {
 					rowCopy[k] = v
 				}
-				_ = db.Insert(rec.Table, rowCopy, rec.XID)
+				if err := db.Insert(rec.Table, rowCopy, rec.XID); err != nil {
+					return replayed, fmt.Errorf("WAL replay (LSN %d, op %s): %w", rec.LSN, rec.Op, err)
+				}
 			}
 		case WALUpdate:
 			for i, oldRow := range rec.OldRows {
@@ -241,18 +244,22 @@ func (w *WALManager) Replay(db *Database) (int, error) {
 				for k, v := range rec.NewRows[i] {
 					newCopy[k] = v
 				}
-				_, _, _, _ = db.UpdateRows(rec.Table,
+				if _, _, _, err := db.UpdateRows(rec.Table,
 					func(r Row) bool { return rowsEqual(r, captured) },
 					func(_ Row) Row { return newCopy },
 					rec.XID,
-				)
+				); err != nil {
+					return replayed, fmt.Errorf("WAL replay (LSN %d, op %s): %w", rec.LSN, rec.Op, err)
+				}
 			}
 		case WALDelete:
 			for _, row := range rec.OldRows {
 				captured := row
-				_, _, _ = db.DeleteRows(rec.Table, func(r Row) bool {
+				if _, _, err := db.DeleteRows(rec.Table, func(r Row) bool {
 					return rowsEqual(r, captured)
-				}, rec.XID)
+				}, rec.XID); err != nil {
+					return replayed, fmt.Errorf("WAL replay (LSN %d, op %s): %w", rec.LSN, rec.Op, err)
+				}
 			}
 		case WALBegin:
 			db.TxManager.mu.Lock()

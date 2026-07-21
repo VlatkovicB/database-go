@@ -124,55 +124,13 @@ func (db *Database) Insert(tableName string, row Row, xid uint64) error {
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
 
-	// Check PRIMARY KEY uniqueness
-	for _, col := range t.Columns {
-		if !col.Primary {
-			continue
-		}
-		pkVal, hasPK := row[col.Name]
-		if !hasPK || pkVal == nil {
-			return fmt.Errorf("null value in column %q violates not-null constraint", col.Name)
-		}
-		for _, pg := range t.Pages {
-			for _, tpl := range pg.Tuples {
-				if tpl.Xmax != 0 {
-					continue
-				}
-				if tpl.Data[col.Name] == pkVal {
-					return fmt.Errorf("duplicate key value violates unique constraint on %q: %q=%v already exists", tableName, col.Name, pkVal)
-				}
-			}
-		}
+	if err := checkPrimaryKey(t, row); err != nil {
+		return err
 	}
-
-	// Check FOREIGN KEY constraints
-	for _, fk := range t.ForeignKeys {
-		val := row[fk.Column]
-		if val == nil {
-			continue // NULL is allowed
-		}
-		refT, ok := db.Tables[fk.RefTable]
-		if !ok {
-			return fmt.Errorf("foreign key references unknown table %q", fk.RefTable)
-		}
-		found := false
-		for _, pg := range refT.Pages {
-			for _, tpl := range pg.Tuples {
-				if tpl.Xmax != 0 {
-					continue
-				}
-				if tpl.Data[fk.RefColumn] == val {
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("insert violates foreign key constraint: %q.%q=%v has no match in %q.%q", tableName, fk.Column, val, fk.RefTable, fk.RefColumn)
-		}
+	if err := checkForeignKeys(t, row, func(name string) *Table {
+		return db.Tables[name]
+	}); err != nil {
+		return err
 	}
 
 	var inserted Tuple
@@ -223,6 +181,17 @@ func (t *Table) rebuildIndexes() {
 	}
 }
 
+// ScanTuples calls fn for every tuple in the table, stopping early if fn returns false.
+func (t *Table) ScanTuples(fn func(Tuple) bool) {
+	for _, pg := range t.Pages {
+		for _, tpl := range pg.Tuples {
+			if !fn(tpl) {
+				return
+			}
+		}
+	}
+}
+
 // Scan returns visible rows and the column schema.
 // snap==nil means auto-commit mode: shows tuples where xmin==0 or committed AND xmax==0.
 func (db *Database) Scan(tableName string, snap *Snapshot, xid uint64) ([]Row, []Column, error) {
@@ -233,13 +202,12 @@ func (db *Database) Scan(tableName string, snap *Snapshot, xid uint64) ([]Row, [
 		return nil, nil, fmt.Errorf("table %q does not exist", tableName)
 	}
 	var rows []Row
-	for _, pg := range t.Pages {
-		for _, tuple := range pg.Tuples {
-			if db.tupleVisible(tuple, snap, xid) {
-				rows = append(rows, tuple.Data)
-			}
+	t.ScanTuples(func(tuple Tuple) bool {
+		if db.tupleVisible(tuple, snap, xid) {
+			rows = append(rows, tuple.Data)
 		}
-	}
+		return true
+	})
 	return rows, t.Columns, nil
 }
 
@@ -275,13 +243,12 @@ func (db *Database) ScanPages(tableName string, snap *Snapshot, xid uint64) ([]T
 		return nil, nil, 0, fmt.Errorf("table %q does not exist", tableName)
 	}
 	var tuples []Tuple
-	for _, pg := range t.Pages {
-		for _, tuple := range pg.Tuples {
-			if db.tupleVisible(tuple, snap, xid) {
-				tuples = append(tuples, tuple)
-			}
+	t.ScanTuples(func(tuple Tuple) bool {
+		if db.tupleVisible(tuple, snap, xid) {
+			tuples = append(tuples, tuple)
 		}
-	}
+		return true
+	})
 	return tuples, t.Columns, len(t.Pages), nil
 }
 
@@ -558,31 +525,8 @@ func (db *Database) DeleteRows(tableName string, predicate func(Row) bool, xid u
 		return 0, nil, fmt.Errorf("table %q does not exist", tableName)
 	}
 
-	// Check FK: no child table may reference rows we're about to delete
-	for childName, child := range db.Tables {
-		for _, fk := range child.ForeignKeys {
-			if fk.RefTable != tableName {
-				continue
-			}
-			for _, pg := range t.Pages {
-				for _, tpl := range pg.Tuples {
-					if tpl.Xmax != 0 || !predicate(tpl.Data) {
-						continue
-					}
-					val := tpl.Data[fk.RefColumn]
-					for _, cpg := range child.Pages {
-						for _, ctpl := range cpg.Tuples {
-							if ctpl.Xmax != 0 {
-								continue
-							}
-							if ctpl.Data[fk.Column] == val {
-								return 0, nil, fmt.Errorf("delete violates foreign key constraint: %q.%q=%v is referenced by %q.%q", tableName, fk.RefColumn, val, childName, fk.Column)
-							}
-						}
-					}
-				}
-			}
-		}
+	if err := checkFKRestrict(t, predicate, db.Tables); err != nil {
+		return 0, nil, err
 	}
 
 	deleted := 0
@@ -659,16 +603,15 @@ func (db *Database) Vacuum(tableName string) (int, error) {
 	}
 	var kept []Tuple
 	reclaimed := 0
-	for _, pg := range t.Pages {
-		for _, tuple := range pg.Tuples {
-			dead := tuple.Xmax != 0 && db.TxManager.IsCommitted(tuple.Xmax)
-			if dead {
-				reclaimed++
-			} else {
-				kept = append(kept, tuple)
-			}
+	t.ScanTuples(func(tuple Tuple) bool {
+		dead := tuple.Xmax != 0 && db.TxManager.IsCommitted(tuple.Xmax)
+		if dead {
+			reclaimed++
+		} else {
+			kept = append(kept, tuple)
 		}
-	}
+		return true
+	})
 	// Rebuild pages
 	t.Pages = nil
 	for pageNum := 0; len(kept) > 0; pageNum++ {

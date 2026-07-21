@@ -239,10 +239,15 @@ type filterNode struct {
 	nodeBase
 	child Node
 	pred  parser.Expression
+	ctx   *EvalCtx
 }
 
 func newFilterNode(child Node, pred parser.Expression) *filterNode {
 	return &filterNode{child: child, pred: pred}
+}
+
+func newFilterNodeWithCtx(child Node, pred parser.Expression, ctx *EvalCtx) *filterNode {
+	return &filterNode{child: child, pred: pred, ctx: ctx}
 }
 
 func (n *filterNode) NodeName() string     { return "Filter" }
@@ -256,7 +261,7 @@ func (n *filterNode) Next() (storage.Row, error) {
 		if err != nil || row == nil {
 			return row, err
 		}
-		pass, err := evalExpr(n.pred, row)
+		pass, err := evalExpr(n.pred, row, n.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -380,7 +385,7 @@ func (n *nestedLoopJoin) Next() (storage.Row, error) {
 		}
 
 		if n.cond != nil {
-			ok, err := evalExpr(n.cond, combined)
+			ok, err := evalExpr(n.cond, combined, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -443,7 +448,7 @@ func (n *hashAggregate) build() error {
 
 		var keyParts []string
 		for _, col := range n.groupBy {
-			val, _ := evalExpr(&parser.IdentExpr{Name: col}, row)
+			val, _ := evalExpr(&parser.IdentExpr{Name: col}, row, nil)
 			keyParts = append(keyParts, fmt.Sprintf("%v", val))
 		}
 		if len(n.groupBy) == 0 {
@@ -456,7 +461,7 @@ func (n *hashAggregate) build() error {
 		} else {
 			kv := map[string]interface{}{}
 			for _, col := range n.groupBy {
-				val, _ := evalExpr(&parser.IdentExpr{Name: col}, row)
+				val, _ := evalExpr(&parser.IdentExpr{Name: col}, row, nil)
 				kv[col] = val
 			}
 			groupIdx[key] = len(groups)
@@ -494,7 +499,7 @@ func (n *hashAggregate) build() error {
 		}
 
 		if n.having != nil {
-			pass, err := evalExpr(n.having, sr)
+			pass, err := evalExpr(n.having, sr, nil)
 			if err != nil {
 				return err
 			}
@@ -534,7 +539,7 @@ func computeAggFromRows(fn, arg string, rows []storage.Row) (interface{}, error)
 		}
 		var count int64
 		for _, row := range rows {
-			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row)
+			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row, nil)
 			if val != nil {
 				count++
 			}
@@ -543,7 +548,7 @@ func computeAggFromRows(fn, arg string, rows []storage.Row) (interface{}, error)
 	case "SUM":
 		var sum float64
 		for _, row := range rows {
-			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row)
+			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row, nil)
 			f, ok := toFloat(val)
 			if !ok {
 				return nil, fmt.Errorf("SUM: column %q is not numeric", arg)
@@ -557,7 +562,7 @@ func computeAggFromRows(fn, arg string, rows []storage.Row) (interface{}, error)
 		}
 		var sum float64
 		for _, row := range rows {
-			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row)
+			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row, nil)
 			f, ok := toFloat(val)
 			if !ok {
 				return nil, fmt.Errorf("AVG: column %q is not numeric", arg)
@@ -571,7 +576,7 @@ func computeAggFromRows(fn, arg string, rows []storage.Row) (interface{}, error)
 		}
 		var minVal interface{}
 		for _, row := range rows {
-			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row)
+			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row, nil)
 			if minVal == nil {
 				minVal = val
 				continue
@@ -593,7 +598,7 @@ func computeAggFromRows(fn, arg string, rows []storage.Row) (interface{}, error)
 		}
 		var maxVal interface{}
 		for _, row := range rows {
-			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row)
+			val, _ := evalExpr(&parser.IdentExpr{Name: arg}, row, nil)
 			if maxVal == nil {
 				maxVal = val
 				continue
@@ -879,7 +884,7 @@ func (n *hashJoin) Open() error {
 			n.innerKeys[k] = true
 		}
 		if n.canHash {
-			keyVal, err := evalExpr(n.innerExpr, row)
+			keyVal, err := evalExpr(n.innerExpr, row, nil)
 			if err == nil && keyVal != nil {
 				key := fmt.Sprintf("%v", keyVal)
 				n.hashTab[key] = append(n.hashTab[key], row)
@@ -922,7 +927,7 @@ func (n *hashJoin) Next() (storage.Row, error) {
 			}
 
 			if n.cond != nil {
-				ok, err := evalExpr(n.cond, combined)
+				ok, err := evalExpr(n.cond, combined, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -963,7 +968,7 @@ func (n *hashJoin) Next() (storage.Row, error) {
 
 		// Probe phase: look up hash table or fall back to linear scan.
 		if n.canHash {
-			keyVal, err := evalExpr(n.outerExpr, n.outerRow)
+			keyVal, err := evalExpr(n.outerExpr, n.outerRow, nil)
 			if err == nil && keyVal != nil {
 				key := fmt.Sprintf("%v", keyVal)
 				n.probeList = n.hashTab[key]
@@ -974,6 +979,48 @@ func (n *hashJoin) Next() (storage.Row, error) {
 		n.probeList = n.fallback
 		n.probePos = 0
 	}
+}
+
+// =============================================================================
+// cteSeqScan — iterates over a pre-materialized CTE result set
+// =============================================================================
+
+type cteSeqScan struct {
+	nodeBase
+	rows  []storage.Row
+	alias string
+	pos   int
+}
+
+func newCTESeqScan(rows []storage.Row, alias string) *cteSeqScan {
+	return &cteSeqScan{rows: rows, alias: alias}
+}
+
+func (n *cteSeqScan) Open() error          { n.pos = 0; return nil }
+func (n *cteSeqScan) Close()               {}
+func (n *cteSeqScan) NodeName() string     { return "CTE Scan" }
+func (n *cteSeqScan) NodeChildren() []Node { return nil }
+
+func (n *cteSeqScan) Next() (storage.Row, error) {
+	if n.pos >= len(n.rows) {
+		return nil, nil
+	}
+	src := n.rows[n.pos]
+	n.pos++
+	if n.alias == "" {
+		return src, nil
+	}
+	// Re-prefix bare column names with the outer alias (e.g. "username" -> "t.username").
+	pfx := n.alias + "."
+	out := make(storage.Row, len(src))
+	for k, v := range src {
+		if strings.Contains(k, ".") {
+			out[k] = v // already prefixed (shouldn't happen but be safe)
+		} else {
+			out[pfx+k] = v
+		}
+	}
+	return out, nil
 }
 
 // =============================================================================

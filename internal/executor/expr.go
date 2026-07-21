@@ -14,14 +14,28 @@ import (
 // aggSpec names an aggregate function and its argument column.
 type aggSpec struct{ fn, arg string }
 
+// EvalCtx carries subquery execution context (executor, outer row for correlated queries, CTEs).
+type EvalCtx struct {
+	exec  *Executor
+	outer storage.Row
+	ctes  map[string]*cteEntry
+}
+
 // evalExpr evaluates an expression against a row and returns the result value.
-func evalExpr(expr parser.Expression, row storage.Row) (interface{}, error) {
+// ctx is nil for simple (non-subquery) expressions and is safe to pass as nil.
+func evalExpr(expr parser.Expression, row storage.Row, ctx *EvalCtx) (interface{}, error) {
 	switch e := expr.(type) {
 	case *parser.IdentExpr:
 		if e.Table != "" {
 			key := e.Table + "." + e.Name
 			if val, ok := row[key]; ok {
 				return val, nil
+			}
+			// Correlated: fall back to outer row
+			if ctx != nil && ctx.outer != nil {
+				if val, ok := ctx.outer[key]; ok {
+					return val, nil
+				}
 			}
 			return nil, fmt.Errorf("column %q.%q not found", e.Table, e.Name)
 		}
@@ -35,11 +49,22 @@ func evalExpr(expr parser.Expression, row storage.Row) (interface{}, error) {
 				return v, nil
 			}
 		}
+		// Correlated: fall back to outer row
+		if ctx != nil && ctx.outer != nil {
+			if val, ok := ctx.outer[e.Name]; ok {
+				return val, nil
+			}
+			for k, v := range ctx.outer {
+				if strings.HasSuffix(k, suffix) {
+					return v, nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("column %q not found", e.Name)
 	case *parser.LiteralExpr:
 		return e.Value, nil
 	case *parser.BinaryExpr:
-		return evalBinary(e, row)
+		return evalBinary(e, row, ctx)
 	case *parser.AggFuncExpr:
 		// In HAVING context, pre-computed aggregate values live in the synthetic row.
 		arg := "*"
@@ -51,37 +76,117 @@ func evalExpr(expr parser.Expression, row storage.Row) (interface{}, error) {
 			return val, nil
 		}
 		return nil, fmt.Errorf("aggregate %s not computed (use in HAVING after GROUP BY)", key)
+
+	case *parser.SubqueryExpr:
+		if ctx == nil || ctx.exec == nil {
+			return nil, fmt.Errorf("scalar subquery requires execution context")
+		}
+		subCtx := &EvalCtx{exec: ctx.exec, outer: row, ctes: ctx.ctes}
+		rows, err := ctx.exec.materializeSubquery(e.Query, subCtx)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		if len(rows) > 1 {
+			return nil, fmt.Errorf("scalar subquery returned more than one row")
+		}
+		for _, v := range rows[0] {
+			return v, nil
+		}
+		return nil, nil
+
+	case *parser.InSubqueryExpr:
+		if ctx == nil || ctx.exec == nil {
+			return nil, fmt.Errorf("IN subquery requires execution context")
+		}
+		leftVal, err := evalExpr(e.Left, row, ctx)
+		if err != nil {
+			return nil, err
+		}
+		var matches bool
+		if e.Query != nil {
+			subCtx := &EvalCtx{exec: ctx.exec, outer: row, ctes: ctx.ctes}
+			rows, err := ctx.exec.materializeSubquery(e.Query, subCtx)
+			if err != nil {
+				return nil, err
+			}
+			for _, r := range rows {
+				for _, v := range r {
+					eq, _ := compare(leftVal, "=", v)
+					if eq {
+						matches = true
+						break
+					}
+				}
+				if matches {
+					break
+				}
+			}
+		} else {
+			for _, valExpr := range e.Values {
+				v, err := evalExpr(valExpr, row, ctx)
+				if err != nil {
+					return nil, err
+				}
+				eq, _ := compare(leftVal, "=", v)
+				if eq {
+					matches = true
+					break
+				}
+			}
+		}
+		if e.Not {
+			return !matches, nil
+		}
+		return matches, nil
+
+	case *parser.ExistsExpr:
+		if ctx == nil || ctx.exec == nil {
+			return nil, fmt.Errorf("EXISTS requires execution context")
+		}
+		subCtx := &EvalCtx{exec: ctx.exec, outer: row, ctes: ctx.ctes}
+		rows, err := ctx.exec.materializeSubquery(e.Query, subCtx)
+		if err != nil {
+			return nil, err
+		}
+		exists := len(rows) > 0
+		if e.Not {
+			return !exists, nil
+		}
+		return exists, nil
 	}
 	return nil, fmt.Errorf("unknown expression type %T", expr)
 }
 
-func evalBinary(e *parser.BinaryExpr, row storage.Row) (interface{}, error) {
+func evalBinary(e *parser.BinaryExpr, row storage.Row, ctx *EvalCtx) (interface{}, error) {
 	if e.Op == "AND" {
-		left, err := evalExpr(e.Left, row)
+		left, err := evalExpr(e.Left, row, ctx)
 		if err != nil {
 			return nil, err
 		}
 		if !boolVal(left) {
 			return false, nil
 		}
-		return evalExpr(e.Right, row)
+		return evalExpr(e.Right, row, ctx)
 	}
 	if e.Op == "OR" {
-		left, err := evalExpr(e.Left, row)
+		left, err := evalExpr(e.Left, row, ctx)
 		if err != nil {
 			return nil, err
 		}
 		if boolVal(left) {
 			return true, nil
 		}
-		return evalExpr(e.Right, row)
+		return evalExpr(e.Right, row, ctx)
 	}
 
-	left, err := evalExpr(e.Left, row)
+	left, err := evalExpr(e.Left, row, ctx)
 	if err != nil {
 		return nil, err
 	}
-	right, err := evalExpr(e.Right, row)
+	right, err := evalExpr(e.Right, row, ctx)
 	if err != nil {
 		return nil, err
 	}

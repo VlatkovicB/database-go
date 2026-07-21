@@ -83,18 +83,35 @@ type tableRef struct {
 
 // qplanner holds state for one planning session.
 type qplanner struct {
-	e  *Executor
-	db *storage.Database
+	e    *Executor
+	db   *storage.Database
+	ctes map[string]*cteEntry
 }
 
-func newQPlanner(e *Executor) *qplanner {
-	return &qplanner{e: e, db: e.db}
+func newQPlanner(e *Executor, ctes map[string]*cteEntry) *qplanner {
+	return &qplanner{e: e, db: e.db, ctes: ctes}
 }
 
 // planScan returns the cheapest physical access path for a single table.
 // where is non-nil only for single-table queries; the planner uses it to
 // select an index scan when one exists and is cheaper than a seq scan.
 func (p *qplanner) planScan(table, alias string, where parser.Expression) *physRelation {
+	// CTE table reference — return a lightweight estimate.
+	if p.ctes != nil {
+		if entry, ok := p.ctes[table]; ok {
+			estRows := math.Max(1, float64(len(entry.rows)))
+			return &physRelation{
+				table:     table,
+				alias:     alias,
+				scanType:  physSeqScan,
+				filter:    where,
+				estRows:   estRows,
+				totalCost: estRows * cpuTupleCost,
+				width:     planWidth,
+			}
+		}
+	}
+
 	rows, _ := p.db.RowCount(table)
 	pages, _ := p.db.PageCount(table)
 	if pages < 1 {
@@ -260,7 +277,7 @@ func buildTableRefs(sel *parser.SelectStatement) []tableRef {
 }
 
 // physRelToVolcano converts a physRelation tree into a live volcano node tree.
-func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Snapshot, xid uint64, logger *ExecLogger) Node {
+func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Snapshot, xid uint64, logger *ExecLogger, ctes map[string]*cteEntry) Node {
 	assign := func(n Node) Node {
 		if l, ok := n.(loggable); ok {
 			l.setLog(logger, logger.NextID())
@@ -269,6 +286,16 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 	}
 
 	if !rel.isJoin() {
+		// CTE table check: use cteSeqScan instead of a real table scan.
+		if ctes != nil {
+			if entry, ok := ctes[rel.table]; ok {
+				n := assign(newCTESeqScan(entry.rows, rel.alias))
+				if rel.filter != nil {
+					n = assign(newFilterNode(n, rel.filter))
+				}
+				return n
+			}
+		}
 		var n Node
 		if rel.scanType == physIndexScan {
 			ip := rel.idxPlan
@@ -282,8 +309,8 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 		return n
 	}
 
-	left := physRelToVolcano(rel.left, db, snap, xid, logger)
-	right := physRelToVolcano(rel.right, db, snap, xid, logger)
+	left := physRelToVolcano(rel.left, db, snap, xid, logger, ctes)
+	right := physRelToVolcano(rel.right, db, snap, xid, logger, ctes)
 
 	// Provide the right side's alias for hash key extraction (only valid when
 	// the right side is itself a leaf scan, not a compound join).
@@ -302,8 +329,19 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 }
 
 // physRelToPlanNode converts a physRelation tree into a planNode tree for EXPLAIN.
-func physRelToPlanNode(rel *physRelation, db *storage.Database) *planNode {
+func physRelToPlanNode(rel *physRelation, db *storage.Database, ctes map[string]*cteEntry) *planNode {
 	if !rel.isJoin() {
+		// CTE Scan label for EXPLAIN
+		if ctes != nil {
+			if _, ok := ctes[rel.table]; ok {
+				return &planNode{
+					label:    "CTE Scan on " + rel.table,
+					estTotal: rel.totalCost,
+					estRows:  int(math.Max(1, rel.estRows)),
+					width:    rel.width,
+				}
+			}
+		}
 		label := "Seq Scan on " + rel.table
 		var extras []string
 		if rel.scanType == physIndexScan {
@@ -331,8 +369,8 @@ func physRelToPlanNode(rel *physRelation, db *storage.Database) *planNode {
 		}
 	}
 
-	leftNode := physRelToPlanNode(rel.left, db)
-	rightNode := physRelToPlanNode(rel.right, db)
+	leftNode := physRelToPlanNode(rel.left, db, ctes)
+	rightNode := physRelToPlanNode(rel.right, db, ctes)
 
 	algLabel := "Nested Loop"
 	if rel.joinAlg == physHashJoin {

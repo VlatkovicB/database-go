@@ -17,8 +17,15 @@ type AggSelectExpr struct {
 	Arg  string // column name or "*"
 }
 
-func (e *ColSelectExpr) selectExprNode() {}
-func (e *AggSelectExpr) selectExprNode() {}
+// ExprSelectExpr is a scalar subquery or expression in the SELECT list with an alias.
+type ExprSelectExpr struct {
+	Expr  Expression
+	Alias string
+}
+
+func (e *ColSelectExpr) selectExprNode()  {}
+func (e *AggSelectExpr) selectExprNode()  {}
+func (e *ExprSelectExpr) selectExprNode() {}
 
 type JoinType string
 
@@ -39,7 +46,14 @@ type OrderByExpr struct {
 	Desc bool
 }
 
+// CTEDef holds one WITH clause entry.
+type CTEDef struct {
+	Name  string
+	Query *SelectStatement
+}
+
 type SelectStatement struct {
+	With     []CTEDef     // WITH clause (CTEs)
 	Distinct bool
 	Exprs    []SelectExpr // nil = SELECT *
 	Table    string
@@ -168,7 +182,29 @@ type AggFuncExpr struct {
 	Arg  Expression // nil means COUNT(*)
 }
 
-func (e *BinaryExpr) expressionNode()  {}
-func (e *IdentExpr) expressionNode()   {}
-func (e *LiteralExpr) expressionNode() {}
-func (e *AggFuncExpr) expressionNode() {}
+// SubqueryExpr is a scalar subquery used as an expression: (SELECT AVG(x) FROM t)
+type SubqueryExpr struct {
+	Query *SelectStatement
+}
+
+// InSubqueryExpr handles col IN (subquery) and col IN (val1, val2, ...) and NOT IN variants.
+type InSubqueryExpr struct {
+	Left   Expression
+	Not    bool
+	Query  *SelectStatement // non-nil for subquery form
+	Values []Expression     // non-nil for literal list form
+}
+
+// ExistsExpr handles EXISTS (subquery) and NOT EXISTS (subquery).
+type ExistsExpr struct {
+	Not   bool
+	Query *SelectStatement
+}
+
+func (e *BinaryExpr) expressionNode()    {}
+func (e *IdentExpr) expressionNode()     {}
+func (e *LiteralExpr) expressionNode()   {}
+func (e *AggFuncExpr) expressionNode()   {}
+func (e *SubqueryExpr) expressionNode()  {}
+func (e *InSubqueryExpr) expressionNode() {}
+func (e *ExistsExpr) expressionNode()    {}

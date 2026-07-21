@@ -55,7 +55,7 @@ func exprToSQL(expr parser.Expression) string {
 // It delegates scan and join selection to the cost-based qplanner so that EXPLAIN
 // shows the same operators that will actually execute.
 func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
-	p := newQPlanner(e)
+	p := newQPlanner(e, nil)
 	refs := buildTableRefs(sel)
 
 	// Pass WHERE only for single-table queries; multi-table WHERE is a filter above the join.
@@ -64,7 +64,7 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 		singleWhere = sel.Where
 	}
 
-	root := physRelToPlanNode(p.planRelations(refs, singleWhere), e.db)
+	root := physRelToPlanNode(p.planRelations(refs, singleWhere), e.db, nil)
 
 	mainN, _ := e.db.RowCount(sel.Table)
 

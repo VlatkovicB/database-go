@@ -141,17 +141,79 @@ func (e *Executor) findIndexPlan(tableName string, where parser.Expression) *ind
 	}
 }
 
-// execPlan holds a volcano node tree and projection info for one SELECT.
-type execPlan struct {
-	root   Node
-	cols   []string // output column names
-	keys   []string // row map keys corresponding to each output column
-	logger *ExecLogger
+// subqueryProj holds a scalar subquery expression to be evaluated per row during projection.
+type subqueryProj struct {
+	colIdx int
+	expr   parser.Expression
 }
 
-// planSelect builds the volcano execution tree from a SelectStatement.
-// Scan and join operator selection is delegated to the cost-based qplanner.
+// execPlan holds a volcano node tree and projection info for one SELECT.
+type execPlan struct {
+	root          Node
+	cols          []string // output column names
+	keys          []string // row map keys corresponding to each output column
+	logger        *ExecLogger
+	ctes          map[string]*cteEntry
+	subqueryExprs []subqueryProj
+}
+
+// containsSubquery returns true if expr contains any subquery expression node.
+func containsSubquery(expr parser.Expression) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *parser.SubqueryExpr, *parser.InSubqueryExpr, *parser.ExistsExpr:
+		return true
+	case *parser.BinaryExpr:
+		return containsSubquery(e.Left) || containsSubquery(e.Right)
+	}
+	return false
+}
+
+// planSelect materializes CTEs and then builds the volcano execution tree.
 func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
+	var ctes map[string]*cteEntry
+	if len(sel.With) > 0 {
+		ctes = make(map[string]*cteEntry)
+		for _, cte := range sel.With {
+			sub, err := e.planSelectWithCTEs(cte.Query, nil)
+			if err != nil {
+				return nil, fmt.Errorf("CTE %q: %w", cte.Name, err)
+			}
+			if err := sub.root.Open(); err != nil {
+				return nil, fmt.Errorf("CTE %q open: %w", cte.Name, err)
+			}
+			var cteRows []storage.Row
+			for {
+				row, err := sub.root.Next()
+				if err != nil {
+					sub.root.Close()
+					return nil, err
+				}
+				if row == nil {
+					break
+				}
+				// Store CTE rows with bare column names (strip any alias prefix)
+				// so that the outer query can re-prefix with whatever alias it uses.
+				projected := make(storage.Row)
+				for i, key := range sub.keys {
+					val := row[key]
+					colName := sub.cols[i] // bare column name (e.g. "username")
+					projected[colName] = val
+				}
+				cteRows = append(cteRows, projected)
+			}
+			sub.root.Close()
+			// Keys stored with bare names; outer query's cteSeqScan will re-prefix.
+			ctes[cte.Name] = &cteEntry{rows: cteRows, cols: sub.cols, keys: sub.cols}
+		}
+	}
+	return e.planSelectWithCTEs(sel, ctes)
+}
+
+// planSelectWithCTEs builds the volcano execution tree from a SelectStatement, using pre-materialized CTEs.
+func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[string]*cteEntry) (*execPlan, error) {
 	alias := sel.Alias
 	if alias == "" {
 		alias = sel.Table
@@ -162,11 +224,24 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 		alias string
 		cols  []storage.Column
 	}
-	baseTable, err := e.db.GetTable(sel.Table)
-	if err != nil {
-		return nil, err
+
+	// Base table columns — check CTEs first.
+	var baseTableCols []storage.Column
+	if ctes != nil {
+		if entry, ok := ctes[sel.Table]; ok {
+			for _, col := range entry.cols {
+				baseTableCols = append(baseTableCols, storage.Column{Name: col})
+			}
+		}
 	}
-	aliasOrder := []aliasInfo{{alias, baseTable.Columns}}
+	if baseTableCols == nil {
+		baseTable, err := e.db.GetTable(sel.Table)
+		if err != nil {
+			return nil, err
+		}
+		baseTableCols = baseTable.Columns
+	}
+	aliasOrder := []aliasInfo{{alias, baseTableCols}}
 	for _, j := range sel.Joins {
 		ja := j.Alias
 		if ja == "" {
@@ -190,19 +265,25 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 	}
 
 	// Cost-based planner: choose scan types and join algorithms.
-	p := newQPlanner(e)
+	p := newQPlanner(e, ctes)
 	refs := buildTableRefs(sel)
+
+	// For single-table queries without subqueries in WHERE, pass WHERE to planner for index selection.
+	// For queries with subqueries in WHERE, we'll add a ctx-aware filter after planning.
 	singleWhere := parser.Expression(nil)
-	if len(sel.Joins) == 0 {
+	if len(sel.Joins) == 0 && !containsSubquery(sel.Where) {
 		singleWhere = sel.Where
 	}
 	physRel := p.planRelations(refs, singleWhere)
 
-	root := physRelToVolcano(physRel, e.db, snap, xid, logger)
+	root := physRelToVolcano(physRel, e.db, snap, xid, logger, ctes)
 
-	// WHERE filter above the join tree (multi-table queries only).
-	if sel.Where != nil && len(sel.Joins) > 0 {
-		root = assignLog(newFilterNode(root, sel.Where))
+	// Apply WHERE filter:
+	// - Multi-table or subquery-in-WHERE: add filter above join/scan with subquery ctx
+	// - Single-table without subqueries: already applied by planner inside physRelToVolcano
+	if sel.Where != nil && (len(sel.Joins) > 0 || containsSubquery(sel.Where)) {
+		sqCtx := &EvalCtx{exec: e, ctes: ctes}
+		root = assignLog(newFilterNodeWithCtx(root, sel.Where, sqCtx))
 	}
 
 	isAgg := len(sel.GroupBy) > 0 || hasAggExprs(sel.Exprs)
@@ -222,7 +303,7 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 		root = assignLog(newLimitNode(root, sel.Limit, sel.Offset))
 	}
 
-	plan := &execPlan{root: root, logger: logger}
+	plan := &execPlan{root: root, logger: logger, ctes: ctes}
 
 	// ---- Projection: map output column names to row keys ----
 
@@ -255,12 +336,23 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 			}
 		} else {
 			for _, expr := range sel.Exprs {
-				ex, ok := expr.(*parser.ColSelectExpr)
-				if !ok {
-					continue
+				switch ex := expr.(type) {
+				case *parser.ColSelectExpr:
+					plan.cols = append(plan.cols, ex.Col)
+					plan.keys = append(plan.keys, alias+"."+ex.Col)
+				case *parser.ExprSelectExpr:
+					colAlias := ex.Alias
+					if colAlias == "" {
+						colAlias = "subquery"
+					}
+					syntheticKey := "__sqexpr__" + colAlias
+					plan.cols = append(plan.cols, colAlias)
+					plan.keys = append(plan.keys, syntheticKey)
+					plan.subqueryExprs = append(plan.subqueryExprs, subqueryProj{
+						colIdx: len(plan.keys) - 1,
+						expr:   ex.Expr,
+					})
 				}
-				plan.cols = append(plan.cols, ex.Col)
-				plan.keys = append(plan.keys, alias+"."+ex.Col)
 			}
 		}
 	} else {
@@ -274,44 +366,55 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 			}
 		} else {
 			for _, expr := range sel.Exprs {
-				ex, ok := expr.(*parser.ColSelectExpr)
-				if !ok {
-					continue
-				}
-				col := ex.Col
-				if strings.HasSuffix(col, ".*") {
-					a := strings.TrimSuffix(col, ".*")
-					for _, ai := range aliasOrder {
-						if ai.alias == a {
-							for _, c := range ai.cols {
-								plan.cols = append(plan.cols, c.Name)
-								plan.keys = append(plan.keys, a+"."+c.Name)
-							}
-							break
-						}
-					}
-				} else if idx := strings.Index(col, "."); idx >= 0 {
-					plan.cols = append(plan.cols, col[idx+1:])
-					plan.keys = append(plan.keys, col)
-				} else {
-					// Unqualified column: search across all joined aliases.
-					found := false
-					for _, ai := range aliasOrder {
-						if found {
-							break
-						}
-						for _, c := range ai.cols {
-							if c.Name == col {
-								plan.cols = append(plan.cols, col)
-								plan.keys = append(plan.keys, ai.alias+"."+col)
-								found = true
+				switch ex := expr.(type) {
+				case *parser.ColSelectExpr:
+					col := ex.Col
+					if strings.HasSuffix(col, ".*") {
+						a := strings.TrimSuffix(col, ".*")
+						for _, ai := range aliasOrder {
+							if ai.alias == a {
+								for _, c := range ai.cols {
+									plan.cols = append(plan.cols, c.Name)
+									plan.keys = append(plan.keys, a+"."+c.Name)
+								}
 								break
 							}
 						}
+					} else if idx := strings.Index(col, "."); idx >= 0 {
+						plan.cols = append(plan.cols, col[idx+1:])
+						plan.keys = append(plan.keys, col)
+					} else {
+						// Unqualified column: search across all joined aliases.
+						found := false
+						for _, ai := range aliasOrder {
+							if found {
+								break
+							}
+							for _, c := range ai.cols {
+								if c.Name == col {
+									plan.cols = append(plan.cols, col)
+									plan.keys = append(plan.keys, ai.alias+"."+col)
+									found = true
+									break
+								}
+							}
+						}
+						if !found {
+							return nil, fmt.Errorf("column %q not found in any joined table", col)
+						}
 					}
-					if !found {
-						return nil, fmt.Errorf("column %q not found in any joined table", col)
+				case *parser.ExprSelectExpr:
+					colAlias := ex.Alias
+					if colAlias == "" {
+						colAlias = "subquery"
 					}
+					syntheticKey := "__sqexpr__" + colAlias
+					plan.cols = append(plan.cols, colAlias)
+					plan.keys = append(plan.keys, syntheticKey)
+					plan.subqueryExprs = append(plan.subqueryExprs, subqueryProj{
+						colIdx: len(plan.keys) - 1,
+						expr:   ex.Expr,
+					})
 				}
 			}
 		}
@@ -442,6 +545,14 @@ func (e *Executor) execSelect(s *parser.SelectStatement) (*Result, error) {
 		r := make([]interface{}, len(plan.keys))
 		for i, key := range plan.keys {
 			r[i] = row[key]
+		}
+		// Evaluate scalar subquery projections (e.g. SELECT (SELECT COUNT(*) ...) AS bc).
+		if len(plan.subqueryExprs) > 0 {
+			sqCtx := &EvalCtx{exec: e, outer: row, ctes: plan.ctes}
+			for _, sp := range plan.subqueryExprs {
+				val, _ := evalExpr(sp.expr, row, sqCtx)
+				r[sp.colIdx] = val
+			}
 		}
 		if seen != nil {
 			key := fmt.Sprintf("%v", r)

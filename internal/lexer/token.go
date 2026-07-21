@@ -83,6 +83,10 @@ const (
 	FOREIGN
 	REFERENCES
 
+	// Subquery / CTE keywords
+	WITH
+	IN
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -150,6 +154,8 @@ var keywords = map[string]TokenType{
 	"VACUUM":      VACUUM,
 	"FOREIGN":     FOREIGN,
 	"REFERENCES":  REFERENCES,
+	"WITH":        WITH,
+	"IN":          IN,
 }
 
 type Token struct {
@@ -175,6 +181,7 @@ var tokenNames = map[TokenType]string{
 	BEGIN: "BEGIN", COMMIT: "COMMIT", ROLLBACK: "ROLLBACK",
 	VACUUM: "VACUUM",
 	FOREIGN: "FOREIGN", REFERENCES: "REFERENCES",
+	WITH: "WITH", IN: "IN",
 	ASTERISK: "*", COMMA: ",", SEMICOLON: ";", LPAREN: "(", RPAREN: ")",
 	DOT: ".", EQ: "=", NEQ: "!=", LT: "<", GT: ">", LTE: "<=", GTE: ">=",
 }
@@ -196,7 +203,8 @@ func (t TokenType) Category() string {
 		INDEX, USING,
 		BEGIN, COMMIT, ROLLBACK,
 		VACUUM,
-		FOREIGN, REFERENCES:
+		FOREIGN, REFERENCES,
+		WITH, IN:
 		return "keyword"
 	case INT, TEXT, BOOLEAN, FLOAT, PRIMARY, KEY:
 		return "type"

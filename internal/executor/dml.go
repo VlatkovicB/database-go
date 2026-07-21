@@ -61,7 +61,7 @@ func (e *Executor) execUpdate(s *parser.UpdateStatement) (*Result, error) {
 			if s.Where == nil {
 				return true
 			}
-			match, _ := evalExpr(s.Where, row)
+			match, _ := evalExpr(s.Where, row, nil)
 			return boolVal(match)
 		},
 		func(row storage.Row) storage.Row {
@@ -108,7 +108,7 @@ func (e *Executor) execDelete(s *parser.DeleteStatement) (*Result, error) {
 		if s.Where == nil {
 			return true
 		}
-		match, _ := evalExpr(s.Where, row)
+		match, _ := evalExpr(s.Where, row, nil)
 		return boolVal(match)
 	}, xid)
 	if err != nil {

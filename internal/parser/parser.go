@@ -18,6 +18,8 @@ func New(tokens []lexer.Token) *Parser {
 
 func (p *Parser) Parse() (Statement, error) {
 	switch p.current().Type {
+	case lexer.WITH:
+		return p.parseWithSelect()
 	case lexer.SELECT:
 		return p.parseSelect()
 	case lexer.INSERT:
@@ -46,7 +48,7 @@ func (p *Parser) Parse() (Statement, error) {
 	case lexer.VACUUM:
 		return p.parseVacuum()
 	default:
-		return nil, fmt.Errorf("unexpected token %q — expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, EXPLAIN, ANALYZE, BEGIN, COMMIT, ROLLBACK, or VACUUM", p.current().Literal)
+		return nil, fmt.Errorf("unexpected token %q — expected WITH, SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, EXPLAIN, ANALYZE, BEGIN, COMMIT, ROLLBACK, or VACUUM", p.current().Literal)
 	}
 }
 
@@ -302,6 +304,56 @@ func (p *Parser) parseOrderByCol() (OrderByExpr, error) {
 }
 
 func (p *Parser) parseSelectColumn() (SelectExpr, error) {
+	// Handle scalar subquery in SELECT list: (SELECT ...) [AS alias]
+	if p.is(lexer.LPAREN) {
+		// Peek to see if it's a subquery
+		saved := p.pos
+		p.advance() // consume (
+		if p.is(lexer.SELECT) {
+			subSel, err := p.parseSelect()
+			if err != nil {
+				return nil, fmt.Errorf("SELECT subquery: %w", err)
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("SELECT subquery: expected )")
+			}
+			alias := "subquery"
+			if p.is(lexer.AS) {
+				p.advance()
+				a, err := p.expect(lexer.IDENT)
+				if err != nil {
+					return nil, fmt.Errorf("SELECT subquery: expected alias after AS")
+				}
+				alias = a.Literal
+			} else if p.is(lexer.IDENT) {
+				alias = p.advance().Literal
+			}
+			return &ExprSelectExpr{Expr: &SubqueryExpr{Query: subSel}, Alias: alias}, nil
+		}
+		// Not a subquery — restore position and fall through
+		p.pos = saved
+	}
+
+	// Handle literal values in SELECT list: SELECT 1, SELECT NULL, etc.
+	if p.is(lexer.INT_LIT) || p.is(lexer.FLOAT_LIT) || p.is(lexer.STRING_LIT) ||
+		p.is(lexer.NULL) || p.is(lexer.TRUE) || p.is(lexer.FALSE) {
+		val, err := p.parseLiteral()
+		if err != nil {
+			return nil, fmt.Errorf("SELECT literal: %w", err)
+		}
+		alias := fmt.Sprintf("%v", val)
+		if p.is(lexer.AS) {
+			p.advance()
+			a, err2 := p.expect(lexer.IDENT)
+			if err2 == nil {
+				alias = a.Literal
+			}
+		} else if p.is(lexer.IDENT) {
+			alias = p.advance().Literal
+		}
+		return &ExprSelectExpr{Expr: &LiteralExpr{Value: val}, Alias: alias}, nil
+	}
+
 	t, err := p.expect(lexer.IDENT)
 	if err != nil {
 		return nil, fmt.Errorf("SELECT: expected column name or aggregate, got %q", p.current().Literal)
@@ -640,6 +692,43 @@ func (p *Parser) parseVacuum() (*VacuumStatement, error) {
 	return &VacuumStatement{Table: name}, nil
 }
 
+// parseWithSelect parses: WITH name AS (SELECT ...) SELECT ...
+func (p *Parser) parseWithSelect() (*SelectStatement, error) {
+	p.advance() // consume WITH
+	var ctes []CTEDef
+	for {
+		name, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return nil, fmt.Errorf("WITH: expected CTE name")
+		}
+		if _, err := p.expect(lexer.AS); err != nil {
+			return nil, fmt.Errorf("WITH %s: expected AS", name.Literal)
+		}
+		if _, err := p.expect(lexer.LPAREN); err != nil {
+			return nil, fmt.Errorf("WITH %s: expected (", name.Literal)
+		}
+		subSel, err := p.parseSelect()
+		if err != nil {
+			return nil, fmt.Errorf("WITH %s: %w", name.Literal, err)
+		}
+		if _, err := p.expect(lexer.RPAREN); err != nil {
+			return nil, fmt.Errorf("WITH %s: expected )", name.Literal)
+		}
+		ctes = append(ctes, CTEDef{Name: name.Literal, Query: subSel})
+		if !p.is(lexer.COMMA) {
+			break
+		}
+		p.advance()
+	}
+	// Parse the outer SELECT
+	sel, err := p.parseSelect()
+	if err != nil {
+		return nil, fmt.Errorf("WITH: outer SELECT: %w", err)
+	}
+	sel.With = ctes
+	return sel, nil
+}
+
 func (p *Parser) parseExplain() (*ExplainStatement, error) {
 	p.advance() // consume EXPLAIN
 	analyze := false
@@ -695,6 +784,51 @@ func (p *Parser) parseComparison() (Expression, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// IN / NOT IN
+	not := false
+	if p.is(lexer.NOT) {
+		p.advance()
+		not = true
+	}
+	if p.is(lexer.IN) {
+		p.advance() // consume IN
+		if _, err := p.expect(lexer.LPAREN); err != nil {
+			return nil, fmt.Errorf("IN: expected (")
+		}
+		// Check if it's a subquery or a literal list
+		if p.is(lexer.SELECT) {
+			subSel, err := p.parseSelect()
+			if err != nil {
+				return nil, fmt.Errorf("IN subquery: %w", err)
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("IN subquery: expected )")
+			}
+			return &InSubqueryExpr{Left: left, Not: not, Query: subSel}, nil
+		}
+		// Literal list: IN ('a', 'b', ...)
+		var values []Expression
+		for !p.is(lexer.RPAREN) && !p.is(lexer.EOF) {
+			val, err := p.parseLiteral()
+			if err != nil {
+				return nil, fmt.Errorf("IN list: %w", err)
+			}
+			values = append(values, &LiteralExpr{Value: val})
+			if p.is(lexer.COMMA) {
+				p.advance()
+			}
+		}
+		if _, err := p.expect(lexer.RPAREN); err != nil {
+			return nil, fmt.Errorf("IN list: expected )")
+		}
+		return &InSubqueryExpr{Left: left, Not: not, Values: values}, nil
+	}
+	// If we consumed NOT but didn't see IN, that's an error
+	if not {
+		return nil, fmt.Errorf("expected IN after NOT")
+	}
+
 	switch p.current().Type {
 	case lexer.EQ, lexer.NEQ, lexer.LT, lexer.GT, lexer.LTE, lexer.GTE:
 		op := p.advance().Literal
@@ -708,6 +842,61 @@ func (p *Parser) parseComparison() (Expression, error) {
 }
 
 func (p *Parser) parsePrimary() (Expression, error) {
+	// EXISTS (subquery)
+	if p.is(lexer.EXISTS) {
+		p.advance()
+		if _, err := p.expect(lexer.LPAREN); err != nil {
+			return nil, fmt.Errorf("EXISTS: expected (")
+		}
+		subSel, err := p.parseSelect()
+		if err != nil {
+			return nil, fmt.Errorf("EXISTS: %w", err)
+		}
+		if _, err := p.expect(lexer.RPAREN); err != nil {
+			return nil, fmt.Errorf("EXISTS: expected )")
+		}
+		return &ExistsExpr{Not: false, Query: subSel}, nil
+	}
+
+	// NOT EXISTS (subquery) or NOT IN (...)
+	if p.is(lexer.NOT) {
+		p.advance()
+		if p.is(lexer.EXISTS) {
+			p.advance()
+			if _, err := p.expect(lexer.LPAREN); err != nil {
+				return nil, fmt.Errorf("NOT EXISTS: expected (")
+			}
+			subSel, err := p.parseSelect()
+			if err != nil {
+				return nil, fmt.Errorf("NOT EXISTS: %w", err)
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("NOT EXISTS: expected )")
+			}
+			return &ExistsExpr{Not: true, Query: subSel}, nil
+		}
+		// NOT without EXISTS — this is an error in our grammar for now
+		return nil, fmt.Errorf("expected EXISTS after NOT")
+	}
+
+	// (SELECT ...) — scalar subquery as expression
+	if p.is(lexer.LPAREN) {
+		saved := p.pos
+		p.advance() // consume (
+		if p.is(lexer.SELECT) {
+			subSel, err := p.parseSelect()
+			if err != nil {
+				return nil, fmt.Errorf("scalar subquery: %w", err)
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("scalar subquery: expected )")
+			}
+			return &SubqueryExpr{Query: subSel}, nil
+		}
+		// Not a subquery — restore and fall through to literal
+		p.pos = saved
+	}
+
 	t := p.current()
 	if p.is(lexer.IDENT) {
 		p.advance()

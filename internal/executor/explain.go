@@ -7,11 +7,13 @@ package executor
 import (
 	"database/internal/parser"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
 
 // planNode is one node in the cost-estimate tree used by EXPLAIN (no ANALYZE).
+// children holds ordered child nodes; joins have two (left then right).
 type planNode struct {
 	label      string
 	estStartup float64
@@ -19,7 +21,7 @@ type planNode struct {
 	estRows    int
 	width      int
 	extras     []string
-	child      *planNode
+	children   []*planNode
 }
 
 func exprToSQL(expr parser.Expression) string {
@@ -49,101 +51,35 @@ func exprToSQL(expr parser.Expression) string {
 	return "?"
 }
 
-// buildScanNode chooses between Index Scan and Seq Scan for the base table.
-func (e *Executor) buildScanNode(sel *parser.SelectStatement, mainN int, pageCount func(string) int, costPerRow float64, width int) *planNode {
-	if sel.Where != nil && len(sel.Joins) == 0 {
-		if ip := e.findIndexPlan(sel.Table, sel.Where); ip != nil {
-			depth := e.db.GetIndexDepth(sel.Table, ip.indexName)
-			sel2 := selectivityExpr(sel.Where, sel.Table, e.db.GetTableStats(sel.Table))
-			estRows := int(float64(mainN) * sel2)
-			if estRows < 1 {
-				estRows = 1
-			}
-			n := &planNode{
-				label:    "Index Scan using " + ip.indexName + " on " + sel.Table,
-				estTotal: float64(depth)*0.25 + float64(estRows)*costPerRow,
-				estRows:  estRows,
-				width:    width,
-			}
-			n.extras = append(n.extras, fmt.Sprintf("Index Cond: (%s.%s)", sel.Table, ip.column))
-			n.extras = append(n.extras, fmt.Sprintf("Index Pages: %d", depth))
-			return n
-		}
-	}
-	n := &planNode{
-		label:    "Seq Scan on " + sel.Table,
-		estTotal: float64(mainN) * costPerRow,
-		estRows:  mainN,
-		width:    width,
-	}
-	n.extras = append(n.extras, fmt.Sprintf("Heap Pages: %d", pageCount(sel.Table)))
-	if sel.Where != nil && len(sel.Joins) == 0 {
-		n.extras = append(n.extras, "Filter: "+exprToSQL(sel.Where))
-		sel2 := e.estimateSelectivity(sel.Table, sel.Where)
-		n.estRows = int(float64(mainN) * sel2)
-		if n.estRows < 1 {
-			n.estRows = 1
-		}
-	}
-	return n
-}
-
 // buildExplainTree builds the cost-estimate planNode tree for EXPLAIN rendering.
+// It delegates scan and join selection to the cost-based qplanner so that EXPLAIN
+// shows the same operators that will actually execute.
 func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
-	const costPerRow = 0.01
-	const width = 64
+	p := newQPlanner(e)
+	refs := buildTableRefs(sel)
 
-	rowCount := func(name string) int {
-		n, err := e.db.RowCount(name)
-		if err != nil {
-			return 100
-		}
-		return n
+	// Pass WHERE only for single-table queries; multi-table WHERE is a filter above the join.
+	singleWhere := parser.Expression(nil)
+	if len(sel.Joins) == 0 {
+		singleWhere = sel.Where
 	}
 
-	pageCount := func(name string) int {
-		n, err := e.db.PageCount(name)
-		if err != nil {
-			return 1
-		}
-		if n < 1 {
-			return 1
-		}
-		return n
-	}
+	root := physRelToPlanNode(p.planRelations(refs, singleWhere), e.db)
 
-	mainN := rowCount(sel.Table)
-	scan := e.buildScanNode(sel, mainN, pageCount, costPerRow, width)
-	root := (*planNode)(scan)
+	mainN, _ := e.db.RowCount(sel.Table)
 
-	for _, j := range sel.Joins {
-		joinN := rowCount(j.Table)
-		outN := root.estRows
-		if joinN < outN {
-			outN = joinN
+	// WHERE filter above the join tree (multi-table only).
+	if sel.Where != nil && len(sel.Joins) > 0 {
+		sel2 := e.estimateSelectivity(sel.Table, sel.Where)
+		filterRows := int(math.Max(1, float64(root.estRows)*sel2))
+		root = &planNode{
+			label:    "Filter",
+			estTotal: root.estTotal + float64(root.estRows)*cpuTupleCost,
+			estRows:  filterRows,
+			width:    root.width,
+			extras:   []string{"Filter: " + exprToSQL(sel.Where)},
+			children: []*planNode{root},
 		}
-		label := "Nested Loop"
-		if j.Type == parser.LeftJoin {
-			label = "Nested Loop Left Join"
-		}
-		jn := &planNode{
-			label:    label,
-			estTotal: root.estTotal + float64(joinN)*costPerRow + 0.05,
-			estRows:  outN,
-			width:    width * 2,
-			child:    root,
-		}
-		if j.Condition != nil {
-			jn.extras = append(jn.extras, "Join Filter: "+exprToSQL(j.Condition))
-		}
-		if sel.Where != nil {
-			jn.extras = append(jn.extras, "Filter: "+exprToSQL(sel.Where))
-			jn.estRows = outN / 2
-			if jn.estRows < 1 {
-				jn.estRows = 1
-			}
-		}
-		root = jn
 	}
 
 	if len(sel.GroupBy) > 0 || hasAggExprs(sel.Exprs) {
@@ -157,10 +93,10 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 		}
 		agg := &planNode{
 			label:    "HashAggregate",
-			estTotal: root.estTotal + float64(inN)*costPerRow,
+			estTotal: root.estTotal + float64(inN)*cpuTupleCost,
 			estRows:  outN,
-			width:    width,
-			child:    root,
+			width:    root.width,
+			children: []*planNode{root},
 		}
 		if len(sel.GroupBy) > 0 {
 			agg.extras = append(agg.extras, "Group Key: "+joinStrings(sel.GroupBy))
@@ -168,10 +104,7 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 		if sel.Having != nil {
 			agg.extras = append(agg.extras, "Filter: "+exprToSQL(sel.Having))
 			havingSel := e.estimateSelectivity(sel.Table, sel.Having)
-			agg.estRows = int(float64(outN) * havingSel)
-			if agg.estRows < 1 {
-				agg.estRows = 1
-			}
+			agg.estRows = int(math.Max(1, float64(outN)*havingSel))
 		}
 		root = agg
 	}
@@ -187,16 +120,15 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 			}
 			cols[i] = ob.Col + " " + dir
 		}
-		srt := &planNode{
+		root = &planNode{
 			label:      "Sort",
 			estStartup: root.estTotal + sortCost,
 			estTotal:   root.estTotal + sortCost,
 			estRows:    inN,
-			width:      width,
-			child:      root,
+			width:      root.width,
+			extras:     []string{"Sort Key: " + joinStrings(cols)},
+			children:   []*planNode{root},
 		}
-		srt.extras = append(srt.extras, "Sort Key: "+joinStrings(cols))
-		root = srt
 	}
 
 	if sel.Distinct {
@@ -210,10 +142,10 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 		}
 		root = &planNode{
 			label:    "Unique",
-			estTotal: root.estTotal + float64(inN)*costPerRow,
+			estTotal: root.estTotal + float64(inN)*cpuTupleCost,
 			estRows:  uniqN,
-			width:    width,
-			child:    root,
+			width:    root.width,
+			children: []*planNode{root},
 		}
 	}
 
@@ -226,8 +158,8 @@ func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
 			label:    "Limit",
 			estTotal: root.estTotal,
 			estRows:  limitN,
-			width:    width,
-			child:    root,
+			width:    root.width,
+			children: []*planNode{root},
 		}
 	}
 
@@ -270,8 +202,8 @@ func renderPlanTree(node *planNode, depth int, analyze bool, actualRows int, tot
 		lines = append(lines, extraIndent+ex)
 	}
 
-	if node.child != nil {
-		lines = append(lines, renderPlanTree(node.child, depth+1, analyze, actualRows, totalMs)...)
+	for _, child := range node.children {
+		lines = append(lines, renderPlanTree(child, depth+1, analyze, actualRows, totalMs)...)
 	}
 
 	return lines
@@ -314,7 +246,9 @@ func injectBuffers(node *planNode, buffers map[string]int) {
 			node.extras = append(node.extras, fmt.Sprintf("Buffers: shared read=%d", count))
 		}
 	}
-	injectBuffers(node.child, buffers)
+	for _, child := range node.children {
+		injectBuffers(child, buffers)
+	}
 }
 
 func (e *Executor) execExplainPlan(stmt parser.Statement) (*Result, error) {

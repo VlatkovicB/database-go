@@ -218,7 +218,16 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 			if err != nil {
 				return nil, fmt.Errorf("GROUP BY: expected column name")
 			}
-			stmt.GroupBy = append(stmt.GroupBy, col.Literal)
+			colName := col.Literal
+			if p.is(lexer.DOT) {
+				p.advance()
+				colPart, err := p.expect(lexer.IDENT)
+				if err != nil {
+					return nil, fmt.Errorf("GROUP BY: expected column after '.'")
+				}
+				colName = col.Literal + "." + colPart.Literal
+			}
+			stmt.GroupBy = append(stmt.GroupBy, colName)
 			if !p.is(lexer.COMMA) {
 				break
 			}
@@ -267,7 +276,14 @@ func (p *Parser) parseOrderByCol() (OrderByExpr, error) {
 		return OrderByExpr{}, fmt.Errorf("ORDER BY: expected column name")
 	}
 	col := t.Literal
-	if p.is(lexer.LPAREN) && isAggFunc(col) {
+	if p.is(lexer.DOT) {
+		p.advance()
+		colPart, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return OrderByExpr{}, fmt.Errorf("ORDER BY: expected column after '.'")
+		}
+		col = t.Literal + "." + colPart.Literal
+	} else if p.is(lexer.LPAREN) && isAggFunc(col) {
 		fn := strings.ToUpper(col)
 		arg, err := p.parseAggParen(fn)
 		if err != nil {

@@ -150,6 +150,7 @@ type execPlan struct {
 }
 
 // planSelect builds the volcano execution tree from a SelectStatement.
+// Scan and join operator selection is delegated to the cost-based qplanner.
 func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 	alias := sel.Alias
 	if alias == "" {
@@ -166,35 +167,6 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 		return nil, err
 	}
 	aliasOrder := []aliasInfo{{alias, baseTable.Columns}}
-
-	// Choose scan strategy: Index Scan (single-table with index) or Seq Scan.
-	var root Node
-	whereHandled := false
-	snap := e.currentSnapshot()
-	xid := e.currentXID()
-
-	logger := newExecLogger()
-	assignLog := func(node Node) Node {
-		if l, ok := node.(loggable); ok {
-			l.setLog(logger, logger.NextID())
-		}
-		return node
-	}
-
-	if len(sel.Joins) == 0 {
-		if ip := e.findIndexPlan(sel.Table, sel.Where); ip != nil {
-			root = assignLog(newIndexScan(e.db, sel.Table, alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp, snap, xid))
-			if ip.residual != nil {
-				root = assignLog(newFilterNode(root, ip.residual))
-			}
-			whereHandled = true
-		}
-	}
-	if root == nil {
-		root = assignLog(newSeqScan(e.db, sel.Table, alias, snap, xid))
-	}
-
-	// Joins — each becomes a NestedLoopJoin wrapping the previous root.
 	for _, j := range sel.Joins {
 		ja := j.Alias
 		if ja == "" {
@@ -205,12 +177,31 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 			return nil, err
 		}
 		aliasOrder = append(aliasOrder, aliasInfo{ja, jt.Columns})
-		inner := assignLog(newSeqScan(e.db, j.Table, ja, snap, xid))
-		root = assignLog(newNestedLoopJoin(root, inner, j.Condition, j.Type))
 	}
 
-	// WHERE filter (skip if already handled by index scan).
-	if sel.Where != nil && !whereHandled {
+	snap := e.currentSnapshot()
+	xid := e.currentXID()
+	logger := newExecLogger()
+	assignLog := func(node Node) Node {
+		if l, ok := node.(loggable); ok {
+			l.setLog(logger, logger.NextID())
+		}
+		return node
+	}
+
+	// Cost-based planner: choose scan types and join algorithms.
+	p := newQPlanner(e)
+	refs := buildTableRefs(sel)
+	singleWhere := parser.Expression(nil)
+	if len(sel.Joins) == 0 {
+		singleWhere = sel.Where
+	}
+	physRel := p.planRelations(refs, singleWhere)
+
+	root := physRelToVolcano(physRel, e.db, snap, xid, logger)
+
+	// WHERE filter above the join tree (multi-table queries only).
+	if sel.Where != nil && len(sel.Joins) > 0 {
 		root = assignLog(newFilterNode(root, sel.Where))
 	}
 

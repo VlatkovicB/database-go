@@ -789,6 +789,194 @@ func (n *distinctNode) Next() (storage.Row, error) {
 }
 
 // =============================================================================
+// hashJoin — builds a hash table on the inner (right) side, probes per outer row
+//
+// This is faster than Nested Loop when both sides are large and no index exists
+// on the inner join key. Build cost: O(inner). Probe cost: O(outer).
+// =============================================================================
+
+// extractHashJoinKeys splits an equality ON condition into outer and inner key
+// expressions, identified by which side references innerAlias.
+func extractHashJoinKeys(cond parser.Expression, innerAlias string) (outerExpr, innerExpr parser.Expression, ok bool) {
+	if innerAlias == "" {
+		return nil, nil, false
+	}
+	bin, isBin := cond.(*parser.BinaryExpr)
+	if !isBin || bin.Op != "=" {
+		return nil, nil, false
+	}
+	leftId, leftOk := bin.Left.(*parser.IdentExpr)
+	rightId, rightOk := bin.Right.(*parser.IdentExpr)
+	if !leftOk || !rightOk {
+		return nil, nil, false
+	}
+	if leftId.Table == innerAlias {
+		return bin.Right, bin.Left, true
+	}
+	if rightId.Table == innerAlias {
+		return bin.Left, bin.Right, true
+	}
+	return nil, nil, false
+}
+
+type hashJoin struct {
+	nodeBase
+	outer      Node
+	inner      Node
+	innerAlias string
+	cond       parser.Expression
+	joinType   parser.JoinType
+
+	// build phase
+	hashTab   map[string][]storage.Row // keyed by inner join-column value
+	fallback  []storage.Row            // used when condition is not a simple equality
+	innerKeys map[string]bool          // all column keys seen in inner rows
+	outerExpr parser.Expression        // outer side of the join equality
+	innerExpr parser.Expression        // inner side of the join equality
+	canHash   bool
+
+	// probe state
+	outerRow     storage.Row
+	probeList    []storage.Row
+	probePos     int
+	emittedMatch bool
+}
+
+func newHashJoin(outer, inner Node, innerAlias string, cond parser.Expression, joinType parser.JoinType) *hashJoin {
+	return &hashJoin{outer: outer, inner: inner, innerAlias: innerAlias, cond: cond, joinType: joinType}
+}
+
+func (n *hashJoin) NodeName() string {
+	if n.joinType == parser.LeftJoin {
+		return "Hash Join Left Join"
+	}
+	return "Hash Join"
+}
+func (n *hashJoin) NodeChildren() []Node { return []Node{n.outer, n.inner} }
+
+func (n *hashJoin) Open() error {
+	if err := n.inner.Open(); err != nil {
+		return err
+	}
+
+	outerExpr, innerExpr, canHash := extractHashJoinKeys(n.cond, n.innerAlias)
+	n.canHash = canHash
+	n.outerExpr = outerExpr
+	n.innerExpr = innerExpr
+	n.hashTab = make(map[string][]storage.Row)
+	n.innerKeys = map[string]bool{}
+
+	// Build phase: scan inner once and hash on the join key.
+	for {
+		row, err := n.inner.Next()
+		if err != nil {
+			return err
+		}
+		if row == nil {
+			break
+		}
+		for k := range row {
+			n.innerKeys[k] = true
+		}
+		if n.canHash {
+			keyVal, err := evalExpr(n.innerExpr, row)
+			if err == nil && keyVal != nil {
+				key := fmt.Sprintf("%v", keyVal)
+				n.hashTab[key] = append(n.hashTab[key], row)
+				continue
+			}
+		}
+		n.fallback = append(n.fallback, row)
+	}
+	n.inner.Close()
+
+	if err := n.outer.Open(); err != nil {
+		return err
+	}
+	n.outerRow = nil
+	n.probeList = nil
+	n.probePos = 0
+	return nil
+}
+
+func (n *hashJoin) Close() {
+	n.outer.Close()
+	n.hashTab = nil
+	n.fallback = nil
+	n.innerKeys = nil
+}
+
+func (n *hashJoin) Next() (storage.Row, error) {
+	for {
+		// Drain remaining probe matches from the current outer row.
+		for n.probePos < len(n.probeList) {
+			innerRow := n.probeList[n.probePos]
+			n.probePos++
+
+			combined := make(storage.Row, len(n.outerRow)+len(innerRow))
+			for k, v := range n.outerRow {
+				combined[k] = v
+			}
+			for k, v := range innerRow {
+				combined[k] = v
+			}
+
+			if n.cond != nil {
+				ok, err := evalExpr(n.cond, combined)
+				if err != nil {
+					return nil, err
+				}
+				if !boolVal(ok) {
+					continue
+				}
+			}
+			n.emittedMatch = true
+			if n.log != nil {
+				n.log.Log(n.id, "Hash Join", "match", combined)
+			}
+			return combined, nil
+		}
+
+		// LEFT JOIN: emit a null-padded row for an unmatched outer row.
+		if n.outerRow != nil && !n.emittedMatch && n.joinType == parser.LeftJoin {
+			nr := make(storage.Row, len(n.outerRow)+len(n.innerKeys))
+			for k, v := range n.outerRow {
+				nr[k] = v
+			}
+			for k := range n.innerKeys {
+				nr[k] = nil
+			}
+			n.outerRow = nil
+			return nr, nil
+		}
+
+		// Advance to next outer row.
+		var err error
+		n.outerRow, err = n.outer.Next()
+		if err != nil {
+			return nil, err
+		}
+		if n.outerRow == nil {
+			return nil, nil
+		}
+		n.emittedMatch = false
+
+		// Probe phase: look up hash table or fall back to linear scan.
+		if n.canHash {
+			keyVal, err := evalExpr(n.outerExpr, n.outerRow)
+			if err == nil && keyVal != nil {
+				key := fmt.Sprintf("%v", keyVal)
+				n.probeList = n.hashTab[key]
+				n.probePos = 0
+				continue
+			}
+		}
+		n.probeList = n.fallback
+		n.probePos = 0
+	}
+}
+
+// =============================================================================
 // instrumentedNode — wraps any Node to collect per-node timing and row counts
 // =============================================================================
 

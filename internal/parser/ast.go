@@ -35,10 +35,12 @@ const (
 )
 
 type JoinClause struct {
-	Type      JoinType
-	Table     string
-	Alias     string
-	Condition Expression
+	Type         JoinType
+	Table        string             // empty when JoinSubquery != nil
+	Alias        string             // required alias for both table and subquery joins
+	Condition    Expression
+	JoinSubquery *SelectStatement   // non-nil for JOIN (SELECT ...) AS alias ON ...
+	Lateral      bool               // true for JOIN LATERAL (SELECT ...) — re-evaluated per outer row
 }
 
 type OrderByExpr struct {
@@ -53,19 +55,20 @@ type CTEDef struct {
 }
 
 type SelectStatement struct {
-	With     []CTEDef     // WITH clause (CTEs)
-	Distinct bool
-	Exprs    []SelectExpr // nil = SELECT *
-	Table    string
-	Alias    string // defaults to table name
-	Joins    []JoinClause
-	Where    Expression
-	GroupBy  []string
-	Having   Expression
-	OrderBy  []OrderByExpr
-	Limit    *int64
-	Offset   *int64
-	ForLock  string // "FOR UPDATE", "FOR SHARE", or ""
+	With         []CTEDef     // WITH clause (CTEs)
+	Distinct     bool
+	Exprs        []SelectExpr // nil = SELECT *
+	Table        string
+	Alias        string           // defaults to table name
+	FromSubquery *SelectStatement // non-nil for FROM (SELECT ...) AS alias
+	Joins        []JoinClause
+	Where        Expression
+	GroupBy      []string
+	Having       Expression
+	OrderBy      []OrderByExpr
+	Limit        *int64
+	Offset       *int64
+	ForLock      string // "FOR UPDATE", "FOR SHARE", or ""
 }
 
 type InsertStatement struct {

@@ -96,6 +96,26 @@ COMMIT;
 
 VACUUM players;
 -- Reclaims dead tuples left behind by committed DELETEs and UPDATEs.
+
+-- Derived tables (subquery in FROM/JOIN)
+SELECT t.username, t.level
+FROM (SELECT username, level FROM players WHERE level > 40) t
+ORDER BY t.level DESC;
+
+SELECT p.username, sub.class
+FROM players p
+JOIN (SELECT DISTINCT class FROM players WHERE level > 10) sub ON p.class = sub.class;
+
+-- LATERAL joins — subquery re-evaluated per outer row, can reference outer columns
+SELECT p.username, sub.level
+FROM players p
+JOIN LATERAL (SELECT level FROM players i WHERE i.class = p.class) AS sub ON sub.level > p.level
+LIMIT 5;
+
+SELECT p.username, sub.level
+FROM players p
+LEFT JOIN LATERAL (SELECT level FROM players i WHERE i.id = p.id) AS sub ON true
+LIMIT 5;
 ```
 
 ### Column types

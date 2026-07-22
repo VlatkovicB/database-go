@@ -1045,6 +1045,192 @@ func (n *cteSeqScan) Next() (storage.Row, error) {
 }
 
 // =============================================================================
+// lateralJoin — re-evaluates a LATERAL subquery for each outer row
+// =============================================================================
+
+type lateralJoin struct {
+	nodeBase
+	outer     Node
+	subq      *parser.SelectStatement
+	alias     string
+	joinType  parser.JoinType
+	onCond    parser.Expression
+	exec      *Executor
+	ctes      map[string]*cteEntry
+	innerCols []string // column names from AST for LEFT JOIN null-padding
+
+	outerRow     storage.Row
+	innerRows    []storage.Row
+	innerIdx     int
+	emittedMatch bool
+	colsKnown    bool
+}
+
+func newLateralJoin(outer Node, subq *parser.SelectStatement, alias string, joinType parser.JoinType, onCond parser.Expression, exec *Executor, ctes map[string]*cteEntry) *lateralJoin {
+	return &lateralJoin{
+		outer:     outer,
+		subq:      subq,
+		alias:     alias,
+		joinType:  joinType,
+		onCond:    onCond,
+		exec:      exec,
+		ctes:      ctes,
+		innerCols: lateralColsFromAST(subq),
+	}
+}
+
+func (n *lateralJoin) NodeName() string {
+	if n.joinType == parser.LeftJoin {
+		return "Nested Loop Left Join (LATERAL)"
+	}
+	return "Nested Loop (LATERAL)"
+}
+func (n *lateralJoin) NodeChildren() []Node { return []Node{n.outer} }
+func (n *lateralJoin) Open() error          { return n.outer.Open() }
+func (n *lateralJoin) Close()               { n.outer.Close() }
+
+func (n *lateralJoin) Next() (storage.Row, error) {
+	for {
+		if n.innerIdx >= len(n.innerRows) {
+			// LEFT JOIN: emit null-padded outer for unmatched row.
+			if n.outerRow != nil && !n.emittedMatch && n.joinType == parser.LeftJoin {
+				nr := make(storage.Row, len(n.outerRow)+len(n.innerCols))
+				for k, v := range n.outerRow {
+					nr[k] = v
+				}
+				for _, col := range n.innerCols {
+					nr[n.alias+"."+col] = nil
+				}
+				n.outerRow = nil
+				return nr, nil
+			}
+			// Advance outer.
+			outerRow, err := n.outer.Next()
+			if err != nil {
+				return nil, err
+			}
+			if outerRow == nil {
+				return nil, nil
+			}
+			n.outerRow = outerRow
+			ctx := &EvalCtx{exec: n.exec, outer: outerRow, ctes: n.ctes}
+			n.innerRows, err = n.exec.materializeSubquery(n.subq, ctx)
+			if err != nil {
+				return nil, err
+			}
+			n.innerIdx = 0
+			n.emittedMatch = false
+		}
+
+		if n.innerIdx >= len(n.innerRows) {
+			continue
+		}
+
+		innerRow := n.innerRows[n.innerIdx]
+		n.innerIdx++
+
+		// Merge outer + re-keyed inner rows.
+		merged := make(storage.Row, len(n.outerRow)+len(innerRow))
+		for k, v := range n.outerRow {
+			merged[k] = v
+		}
+		if !n.colsKnown {
+			n.innerCols = nil
+		}
+		for k, v := range innerRow {
+			col := k
+			if idx := strings.LastIndex(k, "."); idx >= 0 {
+				col = k[idx+1:]
+			}
+			merged[n.alias+"."+col] = v
+			if !n.colsKnown {
+				n.innerCols = append(n.innerCols, col)
+			}
+		}
+		n.colsKnown = true
+
+		// Apply ON condition.
+		if n.onCond != nil {
+			ctx := &EvalCtx{exec: n.exec, outer: n.outerRow, ctes: n.ctes}
+			ok, err := evalExpr(n.onCond, merged, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if !boolVal(ok) {
+				continue
+			}
+		}
+		n.emittedMatch = true
+		return merged, nil
+	}
+}
+
+// lateralColsFromAST derives projected column names from a subquery's SELECT list.
+// Used for LEFT LATERAL JOIN null-padding when the lateral subquery returns no rows.
+func lateralColsFromAST(subq *parser.SelectStatement) []string {
+	if subq == nil || subq.Exprs == nil {
+		return nil
+	}
+	var cols []string
+	for _, expr := range subq.Exprs {
+		switch ex := expr.(type) {
+		case *parser.ColSelectExpr:
+			col := ex.Col
+			if idx := strings.LastIndex(col, "."); idx >= 0 {
+				col = col[idx+1:]
+			}
+			cols = append(cols, col)
+		case *parser.AggSelectExpr:
+			cols = append(cols, ex.Func+"("+ex.Arg+")")
+		case *parser.ExprSelectExpr:
+			if ex.Alias != "" {
+				cols = append(cols, ex.Alias)
+			}
+		}
+	}
+	return cols
+}
+
+// =============================================================================
+// subqueryScan — iterates over a derived table's materialized rows
+// Same row-emission logic as cteSeqScan but shows "Subquery Scan" in EXPLAIN.
+// =============================================================================
+
+type subqueryScan struct {
+	nodeBase
+	rows  []storage.Row
+	alias string
+	pos   int
+}
+
+func newSubqueryScan(rows []storage.Row, alias string) *subqueryScan {
+	return &subqueryScan{rows: rows, alias: alias}
+}
+
+func (n *subqueryScan) Open() error          { n.pos = 0; return nil }
+func (n *subqueryScan) Close()               {}
+func (n *subqueryScan) NodeName() string     { return "Subquery Scan on " + n.alias }
+func (n *subqueryScan) NodeChildren() []Node { return nil }
+
+func (n *subqueryScan) Next() (storage.Row, error) {
+	if n.pos >= len(n.rows) {
+		return nil, nil
+	}
+	src := n.rows[n.pos]
+	n.pos++
+	pfx := n.alias + "."
+	out := make(storage.Row, len(src))
+	for k, v := range src {
+		if strings.Contains(k, ".") {
+			out[k] = v
+		} else {
+			out[pfx+k] = v
+		}
+	}
+	return out, nil
+}
+
+// =============================================================================
 // instrumentedNode — wraps any Node to collect per-node timing and row counts
 // =============================================================================
 

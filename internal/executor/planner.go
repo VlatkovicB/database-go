@@ -255,6 +255,7 @@ func (p *qplanner) planRelations(refs []tableRef, singleTableWhere parser.Expres
 }
 
 // buildTableRefs converts a SelectStatement's table + joins into a flat tableRef slice.
+// LATERAL joins are excluded — they're handled separately as lateralJoin volcano nodes.
 func buildTableRefs(sel *parser.SelectStatement) []tableRef {
 	alias := sel.Alias
 	if alias == "" {
@@ -262,6 +263,9 @@ func buildTableRefs(sel *parser.SelectStatement) []tableRef {
 	}
 	refs := []tableRef{{table: sel.Table, alias: alias}}
 	for _, j := range sel.Joins {
+		if j.Lateral {
+			continue
+		}
 		ja := j.Alias
 		if ja == "" {
 			ja = j.Table
@@ -286,10 +290,15 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 	}
 
 	if !rel.isJoin() {
-		// CTE table check: use cteSeqScan instead of a real table scan.
+		// CTE / derived table check.
 		if ctes != nil {
 			if entry, ok := ctes[rel.table]; ok {
-				n := assign(newCTESeqScan(entry.rows, rel.alias))
+				var n Node
+				if entry.derived {
+					n = assign(newSubqueryScan(entry.rows, rel.alias))
+				} else {
+					n = assign(newCTESeqScan(entry.rows, rel.alias))
+				}
 				if rel.filter != nil {
 					n = assign(newFilterNode(n, rel.filter))
 				}
@@ -331,11 +340,15 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 // physRelToPlanNode converts a physRelation tree into a planNode tree for EXPLAIN.
 func physRelToPlanNode(rel *physRelation, db *storage.Database, ctes map[string]*cteEntry) *planNode {
 	if !rel.isJoin() {
-		// CTE Scan label for EXPLAIN
+		// CTE / derived table label for EXPLAIN.
 		if ctes != nil {
-			if _, ok := ctes[rel.table]; ok {
+			if entry, ok := ctes[rel.table]; ok {
+				label := "CTE Scan on " + rel.table
+				if entry.derived {
+					label = "Subquery Scan on " + rel.table
+				}
 				return &planNode{
-					label:    "CTE Scan on " + rel.table,
+					label:    label,
 					estTotal: rel.totalCost,
 					estRows:  int(math.Max(1, rel.estRows)),
 					width:    rel.width,

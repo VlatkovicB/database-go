@@ -5,11 +5,13 @@ import (
 	"database/internal/storage"
 )
 
-// cteEntry holds materialized data for one CTE.
+// cteEntry holds materialized data for one CTE or derived table.
+// derived=true for FROM/JOIN subqueries; false for WITH CTEs.
 type cteEntry struct {
-	rows []storage.Row
-	cols []string
-	keys []string
+	rows    []storage.Row
+	cols    []string
+	keys    []string
+	derived bool
 }
 
 // materializeSubquery executes subquery q and returns matching rows.
@@ -230,4 +232,34 @@ func ctesFrom(ctx *EvalCtx) map[string]*cteEntry {
 		return nil
 	}
 	return ctx.ctes
+}
+
+// materializeDerivedTable executes subq and returns a cteEntry for use as a derived table.
+// outerCTEs are passed through so the subquery can reference CTEs from the outer query.
+func (e *Executor) materializeDerivedTable(subq *parser.SelectStatement, outerCTEs map[string]*cteEntry) (*cteEntry, error) {
+	sub, err := e.planSelectWithCTEs(subq, outerCTEs)
+	if err != nil {
+		return nil, err
+	}
+	if err := sub.root.Open(); err != nil {
+		return nil, err
+	}
+	defer sub.root.Close()
+
+	var rows []storage.Row
+	for {
+		row, err := sub.root.Next()
+		if err != nil {
+			return nil, err
+		}
+		if row == nil {
+			break
+		}
+		projected := make(storage.Row)
+		for i, key := range sub.keys {
+			projected[sub.cols[i]] = row[key]
+		}
+		rows = append(rows, projected)
+	}
+	return &cteEntry{rows: rows, cols: sub.cols, keys: sub.cols, derived: true}, nil
 }

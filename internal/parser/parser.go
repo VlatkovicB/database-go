@@ -164,6 +164,7 @@ func (p *Parser) parseIntKeyword(kw lexer.TokenType, name string) (*int64, error
 func (p *Parser) parseSelect() (*SelectStatement, error) {
 	p.advance() // consume SELECT
 	stmt := &SelectStatement{}
+	var err error
 
 	if p.is(lexer.DISTINCT) {
 		stmt.Distinct = true
@@ -189,13 +190,48 @@ func (p *Parser) parseSelect() (*SelectStatement, error) {
 	if _, err := p.expect(lexer.FROM); err != nil {
 		return nil, fmt.Errorf("SELECT: expected FROM")
 	}
-	t, err := p.expect(lexer.IDENT)
-	if err != nil {
-		return nil, fmt.Errorf("SELECT: expected table name")
-	}
-	stmt.Table = t.Literal
-	if stmt.Alias, err = p.parseOptionalAlias(t.Literal, "SELECT FROM"); err != nil {
-		return nil, err
+	// Derived table: FROM (SELECT ...) AS alias
+	if p.is(lexer.LPAREN) {
+		saved := p.pos
+		p.advance() // consume (
+		if p.is(lexer.SELECT) {
+			subSel, err := p.parseSelect()
+			if err != nil {
+				return nil, fmt.Errorf("FROM subquery: %w", err)
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return nil, fmt.Errorf("FROM subquery: expected )")
+			}
+			alias, err := p.parseOptionalAlias("", "FROM subquery")
+			if err != nil {
+				return nil, err
+			}
+			if alias == "" {
+				return nil, fmt.Errorf("FROM subquery: alias required (use AS alias)")
+			}
+			stmt.Table = alias
+			stmt.Alias = alias
+			stmt.FromSubquery = subSel
+		} else {
+			p.pos = saved
+			t, err := p.expect(lexer.IDENT)
+			if err != nil {
+				return nil, fmt.Errorf("SELECT: expected table name")
+			}
+			stmt.Table = t.Literal
+			if stmt.Alias, err = p.parseOptionalAlias(t.Literal, "SELECT FROM"); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		t, err := p.expect(lexer.IDENT)
+		if err != nil {
+			return nil, fmt.Errorf("SELECT: expected table name")
+		}
+		stmt.Table = t.Literal
+		if stmt.Alias, err = p.parseOptionalAlias(t.Literal, "SELECT FROM"); err != nil {
+			return nil, err
+		}
 	}
 
 	for p.is(lexer.JOIN) || p.is(lexer.INNER) || p.is(lexer.LEFT) {
@@ -411,6 +447,44 @@ func (p *Parser) parseJoin() (JoinClause, error) {
 	}
 	if _, err := p.expect(lexer.JOIN); err != nil {
 		return JoinClause{}, fmt.Errorf("JOIN: expected JOIN keyword")
+	}
+	lateral := false
+	if p.is(lexer.LATERAL) {
+		lateral = true
+		p.advance()
+	}
+	// Derived table: JOIN [LATERAL] (SELECT ...) AS alias ON ...
+	if p.is(lexer.LPAREN) {
+		saved := p.pos
+		p.advance() // consume (
+		if p.is(lexer.SELECT) {
+			subSel, err := p.parseSelect()
+			if err != nil {
+				return JoinClause{}, fmt.Errorf("JOIN subquery: %w", err)
+			}
+			if _, err := p.expect(lexer.RPAREN); err != nil {
+				return JoinClause{}, fmt.Errorf("JOIN subquery: expected )")
+			}
+			alias, err := p.parseOptionalAlias("", "JOIN subquery")
+			if err != nil {
+				return JoinClause{}, err
+			}
+			if alias == "" {
+				return JoinClause{}, fmt.Errorf("JOIN subquery: alias required")
+			}
+			if _, err := p.expect(lexer.ON); err != nil {
+				return JoinClause{}, fmt.Errorf("JOIN subquery: expected ON")
+			}
+			cond, err := p.parseExpression()
+			if err != nil {
+				return JoinClause{}, err
+			}
+			return JoinClause{Type: jt, Table: alias, Alias: alias, JoinSubquery: subSel, Condition: cond, Lateral: lateral}, nil
+		}
+		p.pos = saved
+	}
+	if lateral {
+		return JoinClause{}, fmt.Errorf("JOIN LATERAL: expected (SELECT ...)")
 	}
 	tbl, err := p.expect(lexer.IDENT)
 	if err != nil {

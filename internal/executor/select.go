@@ -214,6 +214,30 @@ func (e *Executor) planSelect(sel *parser.SelectStatement) (*execPlan, error) {
 
 // planSelectWithCTEs builds the volcano execution tree from a SelectStatement, using pre-materialized CTEs.
 func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[string]*cteEntry) (*execPlan, error) {
+	// Materialize any derived tables (FROM/JOIN subqueries) into the CTEs map.
+	if sel.FromSubquery != nil {
+		if ctes == nil {
+			ctes = make(map[string]*cteEntry)
+		}
+		entry, err := e.materializeDerivedTable(sel.FromSubquery, ctes)
+		if err != nil {
+			return nil, fmt.Errorf("derived table %q: %w", sel.Alias, err)
+		}
+		ctes[sel.Table] = entry
+	}
+	for _, j := range sel.Joins {
+		if j.JoinSubquery != nil && !j.Lateral {
+			if ctes == nil {
+				ctes = make(map[string]*cteEntry)
+			}
+			entry, err := e.materializeDerivedTable(j.JoinSubquery, ctes)
+			if err != nil {
+				return nil, fmt.Errorf("derived table %q: %w", j.Alias, err)
+			}
+			ctes[j.Table] = entry
+		}
+	}
+
 	alias := sel.Alias
 	if alias == "" {
 		alias = sel.Table
@@ -225,7 +249,7 @@ func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[stri
 		cols  []storage.Column
 	}
 
-	// Base table columns — check CTEs first.
+	// Base table columns — check CTEs first (covers derived tables).
 	var baseTableCols []storage.Column
 	if ctes != nil {
 		if entry, ok := ctes[sel.Table]; ok {
@@ -247,6 +271,26 @@ func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[stri
 		if ja == "" {
 			ja = j.Table
 		}
+		// LATERAL: derive column list from subquery AST (not pre-materialized).
+		if j.Lateral && j.JoinSubquery != nil {
+			var latCols []storage.Column
+			for _, col := range lateralColsFromAST(j.JoinSubquery) {
+				latCols = append(latCols, storage.Column{Name: col})
+			}
+			aliasOrder = append(aliasOrder, aliasInfo{ja, latCols})
+			continue
+		}
+		// Check CTEs first — covers derived table joins.
+		if ctes != nil {
+			if entry, ok := ctes[j.Table]; ok {
+				var jCols []storage.Column
+				for _, col := range entry.cols {
+					jCols = append(jCols, storage.Column{Name: col})
+				}
+				aliasOrder = append(aliasOrder, aliasInfo{ja, jCols})
+				continue
+			}
+		}
 		jt, err := e.db.GetTable(j.Table)
 		if err != nil {
 			return nil, err
@@ -266,12 +310,23 @@ func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[stri
 
 	// Cost-based planner: choose scan types and join algorithms.
 	p := newQPlanner(e, ctes)
-	refs := buildTableRefs(sel)
+	refs := buildTableRefs(sel) // lateral joins excluded by buildTableRefs
+
+	// Determine whether any non-lateral joins exist.
+	hasNonLateralJoins := false
+	hasLateralJoins := false
+	for _, j := range sel.Joins {
+		if j.Lateral {
+			hasLateralJoins = true
+		} else {
+			hasNonLateralJoins = true
+		}
+	}
 
 	// For single-table queries without subqueries in WHERE, pass WHERE to planner for index selection.
-	// For queries with subqueries in WHERE, we'll add a ctx-aware filter after planning.
+	// For queries with subqueries in WHERE or lateral joins, we'll add a ctx-aware filter after planning.
 	singleWhere := parser.Expression(nil)
-	if len(sel.Joins) == 0 && !containsSubquery(sel.Where) {
+	if !hasNonLateralJoins && !hasLateralJoins && !containsSubquery(sel.Where) {
 		singleWhere = sel.Where
 	}
 	physRel := p.planRelations(refs, singleWhere)
@@ -285,10 +340,18 @@ func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[stri
 
 	root := physRelToVolcano(physRel, e.db, snap, xid, logger, ctes, lockMode, e.db.LockMgr)
 
+	// Wrap with LATERAL join nodes (must be before WHERE filter so lateral cols are visible).
+	for _, j := range sel.Joins {
+		if !j.Lateral || j.JoinSubquery == nil {
+			continue
+		}
+		root = assignLog(newLateralJoin(root, j.JoinSubquery, j.Alias, j.Type, j.Condition, e, ctes))
+	}
+
 	// Apply WHERE filter:
 	// - Multi-table or subquery-in-WHERE: add filter above join/scan with subquery ctx
 	// - Single-table without subqueries: already applied by planner inside physRelToVolcano
-	if sel.Where != nil && (len(sel.Joins) > 0 || containsSubquery(sel.Where)) {
+	if sel.Where != nil && (hasNonLateralJoins || hasLateralJoins || containsSubquery(sel.Where)) {
 		sqCtx := &EvalCtx{exec: e, ctes: ctes}
 		root = assignLog(newFilterNodeWithCtx(root, sel.Where, sqCtx))
 	}
@@ -345,8 +408,15 @@ func (e *Executor) planSelectWithCTEs(sel *parser.SelectStatement, ctes map[stri
 			for _, expr := range sel.Exprs {
 				switch ex := expr.(type) {
 				case *parser.ColSelectExpr:
-					plan.cols = append(plan.cols, ex.Col)
-					plan.keys = append(plan.keys, alias+"."+ex.Col)
+					col := ex.Col
+					if idx := strings.Index(col, "."); idx >= 0 {
+						// Qualified ref (e.g. t.username) — strip the alias prefix.
+						plan.cols = append(plan.cols, col[idx+1:])
+						plan.keys = append(plan.keys, col)
+					} else {
+						plan.cols = append(plan.cols, col)
+						plan.keys = append(plan.keys, alias+"."+col)
+					}
 				case *parser.ExprSelectExpr:
 					colAlias := ex.Alias
 					if colAlias == "" {

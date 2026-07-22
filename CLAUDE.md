@@ -64,6 +64,14 @@ SELECT class, COUNT(*) FROM players GROUP BY class HAVING COUNT(*) > 2;
 -- ORDER BY / LIMIT / OFFSET
 SELECT username, level FROM players ORDER BY level DESC LIMIT 10 OFFSET 5;
 SELECT class, COUNT(*) FROM players GROUP BY class ORDER BY COUNT(*) DESC;
+
+-- Subquery in FROM (derived tables / Phase 10)
+SELECT t.username, t.level FROM (SELECT username, level FROM players WHERE level > 40) t ORDER BY t.level DESC;
+SELECT p.username, sub.class FROM players p JOIN (SELECT DISTINCT class FROM players WHERE level > 10) sub ON p.class = sub.class;
+
+-- LATERAL joins (Phase 11) — subquery re-evaluated per outer row, can reference outer cols
+SELECT p.username, sub.level FROM players p JOIN LATERAL (SELECT level FROM players i WHERE i.class = p.class) AS sub ON sub.level > p.level LIMIT 5;
+SELECT p.username, sub.level FROM players p LEFT JOIN LATERAL (SELECT level FROM players i WHERE i.id = p.id) AS sub ON true LIMIT 5;
 ```
 
 Column types: `INT`, `TEXT`, `BOOLEAN`, `FLOAT`.
@@ -114,7 +122,9 @@ VACUUM players;  -- reclaim dead tuples left by committed DELETEs/UPDATEs
 
 ## AST shape
 
-`SelectStatement` fields: `Distinct bool`, `Exprs []SelectExpr` (`ColSelectExpr` | `AggSelectExpr`), `Table`, `Alias`, `Joins []JoinClause`, `Where Expression`, `GroupBy []string`, `Having Expression`, `OrderBy []OrderByExpr`, `Limit *int64`, `Offset *int64`.
+`SelectStatement` fields: `Distinct bool`, `Exprs []SelectExpr` (`ColSelectExpr` | `AggSelectExpr`), `Table`, `Alias`, `FromSubquery *SelectStatement` (non-nil for `FROM (SELECT ...) AS alias`), `Joins []JoinClause`, `Where Expression`, `GroupBy []string`, `Having Expression`, `OrderBy []OrderByExpr`, `Limit *int64`, `Offset *int64`.
+
+`JoinClause` fields: `Type`, `Table`, `Alias`, `Condition`, `JoinSubquery *SelectStatement` (non-nil for `JOIN (SELECT ...) AS alias ON ...`), `Lateral bool` (true for `JOIN LATERAL`). LATERAL joins are NOT pre-materialized — re-evaluated per outer row via `lateralJoin` volcano node.
 
 `CreateTableStatement` fields: `Table string`, `Columns []ColumnDef`, `ForeignKeys []ForeignKeyConstraint`. `ColumnDef.Primary bool` marks PRIMARY KEY columns. `ForeignKeyConstraint` holds `Column`, `RefTable`, `RefColumn` — parsed from `FOREIGN KEY (col) REFERENCES table(col)`.
 

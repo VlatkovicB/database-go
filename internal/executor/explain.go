@@ -56,21 +56,82 @@ func exprToSQL(expr parser.Expression) string {
 // It delegates scan and join selection to the cost-based qplanner so that EXPLAIN
 // shows the same operators that will actually execute.
 func (e *Executor) buildExplainTree(sel *parser.SelectStatement) *planNode {
-	p := newQPlanner(e, nil)
+	// Build fake CTE entries for any derived tables so physRelToPlanNode can label them.
+	var explainCTEs map[string]*cteEntry
+	if sel.FromSubquery != nil {
+		explainCTEs = make(map[string]*cteEntry)
+		explainCTEs[sel.Table] = &cteEntry{derived: true}
+	}
+	hasNonLateralJoins := false
+	hasLateralJoins := false
+	for _, j := range sel.Joins {
+		if j.Lateral {
+			hasLateralJoins = true
+		} else {
+			hasNonLateralJoins = true
+		}
+		if j.JoinSubquery != nil && !j.Lateral {
+			if explainCTEs == nil {
+				explainCTEs = make(map[string]*cteEntry)
+			}
+			explainCTEs[j.Table] = &cteEntry{derived: true}
+		}
+	}
+
+	p := newQPlanner(e, explainCTEs)
 	refs := buildTableRefs(sel)
 
-	// Pass WHERE only for single-table queries; multi-table WHERE is a filter above the join.
+	// Pass WHERE only for single-table queries (no lateral or regular joins).
 	singleWhere := parser.Expression(nil)
-	if len(sel.Joins) == 0 {
+	if !hasNonLateralJoins && !hasLateralJoins {
 		singleWhere = sel.Where
 	}
 
-	root := physRelToPlanNode(p.planRelations(refs, singleWhere), e.db, nil)
+	root := physRelToPlanNode(p.planRelations(refs, singleWhere), e.db, explainCTEs)
+
+	// For derived table in FROM, wrap the outer Subquery Scan node with the inner plan tree.
+	if sel.FromSubquery != nil {
+		innerTree := e.buildExplainTree(sel.FromSubquery)
+		root.children = append(root.children, innerTree)
+	}
+	for _, j := range sel.Joins {
+		if j.JoinSubquery != nil && !j.Lateral {
+			innerTree := e.buildExplainTree(j.JoinSubquery)
+			attachSubqueryScanChild(root, j.Alias, innerTree)
+		}
+	}
+
+	// Wrap LATERAL joins in EXPLAIN tree (mirrors execution order).
+	for _, j := range sel.Joins {
+		if !j.Lateral || j.JoinSubquery == nil {
+			continue
+		}
+		algLabel := "Nested Loop (LATERAL)"
+		if j.Type == parser.LeftJoin {
+			algLabel = "Nested Loop Left Join (LATERAL)"
+		}
+		var extras []string
+		if j.Condition != nil {
+			extras = []string{"Join Filter: " + exprToSQL(j.Condition)}
+		}
+		innerTree := e.buildExplainTree(j.JoinSubquery)
+		root = &planNode{
+			label:    algLabel,
+			estTotal: root.estTotal * 10,
+			estRows:  root.estRows,
+			width:    root.width + planWidth,
+			extras:   extras,
+			children: []*planNode{root, innerTree},
+		}
+	}
 
 	mainN, _ := e.db.RowCount(sel.Table)
+	if sel.FromSubquery != nil && root != nil {
+		mainN = root.estRows
+	}
 
 	// WHERE filter above the join tree (multi-table only).
-	if sel.Where != nil && len(sel.Joins) > 0 {
+	if sel.Where != nil && (hasNonLateralJoins || hasLateralJoins) {
 		sel2 := e.estimateSelectivity(sel.Table, sel.Where)
 		filterRows := int(math.Max(1, float64(root.estRows)*sel2))
 		root = &planNode{
@@ -208,6 +269,24 @@ func renderPlanTree(node *planNode, depth int, analyze bool, actualRows int, tot
 	}
 
 	return lines
+}
+
+// attachSubqueryScanChild walks a planNode tree and attaches inner as a child
+// of the first "Subquery Scan on alias" node it finds.
+func attachSubqueryScanChild(node *planNode, alias string, inner *planNode) bool {
+	if node == nil {
+		return false
+	}
+	if node.label == "Subquery Scan on "+alias {
+		node.children = append(node.children, inner)
+		return true
+	}
+	for _, child := range node.children {
+		if attachSubqueryScanChild(child, alias, inner) {
+			return true
+		}
+	}
+	return false
 }
 
 func planToResult(lines []string) *Result {

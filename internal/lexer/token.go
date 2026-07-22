@@ -91,6 +91,9 @@ const (
 	FOR
 	SHARE
 
+	// Lateral join keyword
+	LATERAL
+
 	// Symbols
 	ASTERISK  // *
 	COMMA     // ,
@@ -162,6 +165,7 @@ var keywords = map[string]TokenType{
 	"IN":          IN,
 	"FOR":         FOR,
 	"SHARE":       SHARE,
+	"LATERAL":     LATERAL,
 }
 
 type Token struct {

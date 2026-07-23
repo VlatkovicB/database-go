@@ -21,16 +21,20 @@ import (
 	"database/internal/storage"
 	"fmt"
 	"math"
+	"runtime"
 )
 
 // PG-style cost constants.
 const (
-	seqPageCost     = 1.0
-	randPageCost    = 4.0
-	cpuTupleCost    = 0.01
-	cpuOperatorCost = 0.0025
-	cpuIndexCost    = 0.005
-	planWidth       = 64
+	seqPageCost      = 1.0
+	randPageCost     = 4.0
+	cpuTupleCost     = 0.01
+	cpuOperatorCost  = 0.0025
+	cpuIndexCost     = 0.005
+	planWidth        = 64
+	parallelSetupCost = 10.0 // fixed overhead for Gather (goroutine startup, not PG process fork)
+	parallelMinRows   = 1000.0 // minimum estimated rows before parallel scan is considered
+	maxParallelWorkers = 4     // cap on parallel worker goroutines
 )
 
 type physScanType int
@@ -65,10 +69,11 @@ type physRelation struct {
 	right    *physRelation
 
 	// Cost estimates (PG convention: startup + total cost).
-	startupCost float64
-	totalCost   float64
-	estRows     float64
-	width       int
+	startupCost     float64
+	totalCost       float64
+	estRows         float64
+	width           int
+	parallelWorkers int // >0 means Gather + Parallel Seq Scan
 }
 
 func (r *physRelation) isJoin() bool { return r.left != nil }
@@ -165,6 +170,31 @@ func (p *qplanner) planScan(table, alias string, where parser.Expression) *physR
 			}
 		}
 	}
+
+	// Parallel SeqScan: cheaper than serial when table is large enough.
+	// Cost model: startup=parallelSetupCost, total=parallelSetupCost + seqCost/nWorkers
+	// Mirrors PG's parallel_setup_cost + (seqCost / max_parallel_workers_per_gather).
+	if best.scanType == physSeqScan && best.estRows > parallelMinRows {
+		nWorkers := runtime.NumCPU()
+		if nWorkers > maxParallelWorkers {
+			nWorkers = maxParallelWorkers
+		}
+		parallelTotal := parallelSetupCost + seqCost/float64(nWorkers)
+		if parallelTotal < best.totalCost {
+			best = &physRelation{
+				table:           best.table,
+				alias:           best.alias,
+				scanType:        physSeqScan,
+				filter:          best.filter,
+				estRows:         best.estRows,
+				startupCost:     parallelSetupCost,
+				totalCost:       parallelTotal,
+				width:           best.width,
+				parallelWorkers: nWorkers,
+			}
+		}
+	}
+
 	return best
 }
 
@@ -309,6 +339,8 @@ func physRelToVolcano(rel *physRelation, db *storage.Database, snap *storage.Sna
 		if rel.scanType == physIndexScan {
 			ip := rel.idxPlan
 			n = assign(newIndexScan(db, rel.table, rel.alias, ip.indexName, ip.column, ip.lo, ip.loOp, ip.hi, ip.hiOp, snap, xid))
+		} else if rel.parallelWorkers > 0 {
+			n = assign(newParallelSeqScan(db, rel.table, rel.alias, snap, xid, rel.parallelWorkers))
 		} else {
 			n = assign(newSeqScan(db, rel.table, rel.alias, snap, xid, lockMode, lockMgr))
 		}
@@ -368,17 +400,41 @@ func physRelToPlanNode(rel *physRelation, db *storage.Database, ctes map[string]
 			if pc < 1 {
 				pc = 1
 			}
+			if rel.parallelWorkers > 0 {
+				// Two-level plan: Gather → Parallel Seq Scan (mirrors PG output).
+				var innerExtras []string
+				innerExtras = append(innerExtras, fmt.Sprintf("Heap Pages: %d", pc))
+				if rel.filter != nil {
+					innerExtras = append(innerExtras, "Filter: "+exprToSQL(rel.filter))
+				}
+				innerNode := &planNode{
+					label:    "Parallel Seq Scan on " + rel.table,
+					estTotal: (rel.totalCost - parallelSetupCost) * float64(rel.parallelWorkers),
+					estRows:  int(math.Max(1, rel.estRows)),
+					width:    rel.width,
+					extras:   innerExtras,
+				}
+				return &planNode{
+					label:      "Gather",
+					estStartup: parallelSetupCost,
+					estTotal:   rel.totalCost,
+					estRows:    int(math.Max(1, rel.estRows)),
+					width:      rel.width,
+					extras:     []string{fmt.Sprintf("Workers Planned: %d", rel.parallelWorkers)},
+					children:   []*planNode{innerNode},
+				}
+			}
 			extras = append(extras, fmt.Sprintf("Heap Pages: %d", pc))
 			if rel.filter != nil {
 				extras = append(extras, "Filter: "+exprToSQL(rel.filter))
 			}
 		}
 		return &planNode{
-			label:     label,
-			estTotal:  rel.totalCost,
-			estRows:   int(math.Max(1, rel.estRows)),
-			width:     rel.width,
-			extras:    extras,
+			label:    label,
+			estTotal: rel.totalCost,
+			estRows:  int(math.Max(1, rel.estRows)),
+			width:    rel.width,
+			extras:   extras,
 		}
 	}
 

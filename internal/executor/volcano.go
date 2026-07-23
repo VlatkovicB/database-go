@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -164,6 +165,113 @@ func (n *seqScan) Next() (storage.Row, error) {
 }
 
 func (n *seqScan) Close() { n.tuples = nil }
+
+// =============================================================================
+// parallelSeqScan — Gather node: splits heap pages across N worker goroutines,
+// merges results. Mirrors PG's Parallel Seq Scan + Gather plan shape.
+// Row locks (FOR UPDATE) are not supported in parallel mode.
+// =============================================================================
+
+type parallelSeqScan struct {
+	nodeBase
+	db         *storage.Database
+	table      string
+	alias      string
+	snap       *storage.Snapshot
+	xid        uint64
+	numWorkers int
+	tuples     []storage.Tuple
+	pos        int
+	bufHits    int
+	bufMisses  int
+}
+
+func newParallelSeqScan(db *storage.Database, table, alias string, snap *storage.Snapshot, xid uint64, numWorkers int) *parallelSeqScan {
+	return &parallelSeqScan{db: db, table: table, alias: alias, snap: snap, xid: xid, numWorkers: numWorkers}
+}
+
+func (n *parallelSeqScan) NodeName() string     { return "Parallel Seq Scan on " + n.table }
+func (n *parallelSeqScan) NodeChildren() []Node { return nil }
+func (n *parallelSeqScan) BuffersRead() int     { return n.bufHits + n.bufMisses }
+func (n *parallelSeqScan) BufferHits() int      { return n.bufHits }
+func (n *parallelSeqScan) BufferMisses() int    { return n.bufMisses }
+func (n *parallelSeqScan) ScanTable() string    { return n.table }
+
+func (n *parallelSeqScan) Open() error {
+	pageCount, err := n.db.PageCount(n.table)
+	if err != nil {
+		return err
+	}
+	if pageCount == 0 {
+		n.pos = 0
+		return nil
+	}
+
+	workers := n.numWorkers
+	if workers > pageCount {
+		workers = pageCount
+	}
+	chunkSize := (pageCount + workers - 1) / workers
+
+	type workerResult struct {
+		tuples []storage.Tuple
+		hits   int64
+		misses int64
+	}
+	ch := make(chan workerResult, workers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if start >= pageCount {
+			break
+		}
+		wg.Add(1)
+		go func(startPage, endPage int) {
+			defer wg.Done()
+			tuples, stats, _ := n.db.ScanPagesRange(n.table, startPage, endPage, n.snap, n.xid)
+			ch <- workerResult{tuples: tuples, hits: stats.Hits, misses: stats.Misses}
+		}(start, end)
+	}
+
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	pfx := n.alias + "."
+	for res := range ch {
+		n.bufHits += int(res.hits)
+		n.bufMisses += int(res.misses)
+		for _, t := range res.tuples {
+			row := make(storage.Row, len(t.Data)+1)
+			for k, v := range t.Data {
+				row[pfx+k] = v
+			}
+			row[pfx+"ctid"] = t.CTID()
+			n.tuples = append(n.tuples, storage.Tuple{
+				PageNum: t.PageNum, SlotNum: t.SlotNum, Data: row, Xmin: t.Xmin, Xmax: t.Xmax,
+			})
+		}
+	}
+	n.pos = 0
+	return nil
+}
+
+func (n *parallelSeqScan) Next() (storage.Row, error) {
+	if n.pos >= len(n.tuples) {
+		return nil, nil
+	}
+	row := n.tuples[n.pos].Data
+	n.pos++
+	if n.log != nil {
+		n.log.Log(n.id, "Parallel Seq Scan", "scan", row)
+	}
+	return row, nil
+}
+
+func (n *parallelSeqScan) Close() { n.tuples = nil }
 
 // =============================================================================
 // indexScan — reads rows from a B+ tree index, emits alias-prefixed rows

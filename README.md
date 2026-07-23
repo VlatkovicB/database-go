@@ -116,6 +116,10 @@ SELECT p.username, sub.level
 FROM players p
 LEFT JOIN LATERAL (SELECT level FROM players i WHERE i.id = p.id) AS sub ON true
 LIMIT 5;
+
+-- Parallel SeqScan — auto-selected by planner when table has >1000 estimated rows
+-- EXPLAIN shows: Gather (Workers Planned: N) -> Parallel Seq Scan on t
+EXPLAIN SELECT * FROM big_table;
 ```
 
 ### Column types

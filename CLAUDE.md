@@ -72,6 +72,10 @@ SELECT p.username, sub.class FROM players p JOIN (SELECT DISTINCT class FROM pla
 -- LATERAL joins (Phase 11) — subquery re-evaluated per outer row, can reference outer cols
 SELECT p.username, sub.level FROM players p JOIN LATERAL (SELECT level FROM players i WHERE i.class = p.class) AS sub ON sub.level > p.level LIMIT 5;
 SELECT p.username, sub.level FROM players p LEFT JOIN LATERAL (SELECT level FROM players i WHERE i.id = p.id) AS sub ON true LIMIT 5;
+
+-- Parallel SeqScan (Phase 12) — planner auto-selects when estRows > 1000; EXPLAIN shows Gather node
+-- EXPLAIN: "Gather (Workers Planned: 4) -> Parallel Seq Scan on t"
+-- No manual hint needed; planner picks it when parallel cost < serial cost
 ```
 
 Column types: `INT`, `TEXT`, `BOOLEAN`, `FLOAT`.
@@ -119,6 +123,8 @@ VACUUM players;  -- reclaim dead tuples left by committed DELETEs/UPDATEs
 | WAL | `internal/storage/wal.go` | `WALManager`, `WALRecord`, `WALOp`; `TakeCheckpoint`, `RestoreCheckpoint`, `Replay` |
 | Seed data | `api/seed.go` | `seedStatements []string` — 10 game tables |
 | Frontend | `cmd/server/web/index.html` | Pipeline animation, exec-order panel, Seed + Format buttons |
+| Parallel scan | `internal/executor/volcano.go` | `parallelSeqScan` node: splits pages across N goroutines via `ScanPagesRange`; implements `BufferReporter` |
+| Parallel storage | `internal/storage/storage.go` | `ScanPagesRange(table, start, end, snap, xid)` — per-worker page-range scan; concurrent RLock safe |
 
 ## AST shape
 

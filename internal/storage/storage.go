@@ -268,6 +268,42 @@ func (db *Database) ScanPages(tableName string, snap *Snapshot, xid uint64) ([]T
 	return tuples, t.Columns, len(t.Pages), stats, nil
 }
 
+// ScanPagesRange returns visible tuples from pages[startPage:endPage].
+// Used by parallel workers — each worker scans a disjoint page range concurrently.
+// Multiple goroutines may call this simultaneously; RLock allows concurrent readers.
+func (db *Database) ScanPagesRange(tableName string, startPage, endPage int, snap *Snapshot, xid uint64) ([]Tuple, BPStats, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	t, ok := db.Tables[tableName]
+	if !ok {
+		return nil, BPStats{}, fmt.Errorf("table %q does not exist", tableName)
+	}
+	if startPage < 0 {
+		startPage = 0
+	}
+	if endPage > len(t.Pages) {
+		endPage = len(t.Pages)
+	}
+	var tuples []Tuple
+	var stats BPStats
+	for i := startPage; i < endPage; i++ {
+		id := PageID{Table: tableName, PageNum: i}
+		slot, hit := db.BPM.FetchPage(id)
+		if hit {
+			stats.Hits++
+		} else {
+			stats.Misses++
+		}
+		for _, tpl := range t.Pages[i].Tuples {
+			if db.tupleVisible(tpl, snap, xid) {
+				tuples = append(tuples, tpl)
+			}
+		}
+		db.BPM.Unpin(slot, false)
+	}
+	return tuples, stats, nil
+}
+
 func (db *Database) RowCount(tableName string) (int, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
